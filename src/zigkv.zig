@@ -5,6 +5,11 @@
 //! byte-level specification.
 //!
 //! This module is the public facade: `Store`, `Entry`, and `Iterator`.
+//!
+//! The field widths (hash, key index, value index) are fixed when a store is
+//! created, so every public operation dispatches on them exactly once and then
+//! runs fully specialized code (`Impl`). Nothing below that boundary re-checks
+//! a width.
 
 const std = @import("std");
 const arena = @import("arena.zig");
@@ -87,59 +92,14 @@ pub const Store = struct {
     /// `getView` result before passing it back to `put`. On error the store is
     /// logically unchanged.
     pub fn put(self: *Store, key: []const u8, value: []const u8) !void {
-        const hash_value = self.hashOf(key);
-
-        if (self.hash_table.lookup(&self.keys, key, hash_value)) |slot| {
-            const value_len: u64 = @intCast(value.len);
-            if (value_len > self.maxValueLen()) return error.ValueTooLarge;
-
-            const old_off = slot.entry.val_off;
-            const header_size = format.blockHeaderSize(self.header.flags.value_index);
-            const old_size = self.values.blockSize(old_off);
-
-            if (value_len <= old_size - header_size) {
-                // Keep the block: write the new payload, update `len`, and
-                // return any tail that can hold a minimum block.
-                if (value.len != 0) {
-                    @memcpy(self.values.payloadSpan(old_off)[0..value.len], value);
-                }
-                try self.values.shrinkToFit(old_off, value_len);
-            } else {
-                const new_off = try self.values.alloc(value_len);
-                errdefer freeBlock(&self.values, new_off);
-
-                @memcpy(self.values.payloadMut(new_off), value);
-                self.hash_table.setValueOffset(slot.index, new_off);
-                freeBlock(&self.values, old_off);
-            }
-
-            self.syncHeader();
-            self.generation += 1;
-            return;
+        switch (self.header.flags.hash) {
+            inline else => |hash_width| switch (self.header.flags.key_index) {
+                inline else => |key_width| switch (self.header.flags.value_index) {
+                    inline else => |value_width| return Impl(hash_width, key_width, value_width)
+                        .put(self, key, value),
+                },
+            },
         }
-
-        const key_len: u64 = @intCast(key.len);
-        const value_len: u64 = @intCast(value.len);
-        if (key_len > self.maxKeyLen()) return error.KeyTooLarge;
-        if (value_len > self.maxValueLen()) return error.ValueTooLarge;
-        if (self.hash_table.count >= self.hash_table.maxEntries()) {
-            return error.TableFull;
-        }
-
-        // Allocate both blocks before mutating the table so an allocation
-        // failure leaves the store logically unchanged.
-        const key_off = try self.keys.alloc(key_len);
-        errdefer freeBlock(&self.keys, key_off);
-        @memcpy(self.keys.payloadMut(key_off), key);
-
-        const val_off = try self.values.alloc(value_len);
-        errdefer freeBlock(&self.values, val_off);
-        @memcpy(self.values.payloadMut(val_off), value);
-
-        try self.hash_table.insert(&self.keys, key, hash_value, key_off, val_off);
-
-        self.syncHeader();
-        self.generation += 1;
     }
 
     /// Copy a value into `buffer`. Returns null when the key is missing, or
@@ -150,22 +110,28 @@ pub const Store = struct {
         key: []const u8,
         buffer: []u8,
     ) !?[]const u8 {
-        const slot = self.hash_table.lookup(&self.keys, key, self.hashOf(key)) orelse
-            return null;
-
-        const value = self.values.payload(slot.entry.val_off);
-        if (value.len > buffer.len) return error.BufferTooSmall;
-        @memcpy(buffer[0..value.len], value);
-        return buffer[0..value.len];
+        switch (self.header.flags.hash) {
+            inline else => |hash_width| switch (self.header.flags.key_index) {
+                inline else => |key_width| switch (self.header.flags.value_index) {
+                    inline else => |value_width| return Impl(hash_width, key_width, value_width)
+                        .get(self, key, buffer),
+                },
+            },
+        }
     }
 
     /// Borrowed view of a value, valid until the next `put`, `remove` or
     /// `deinit`. No allocation. The slice must be copied before being passed
     /// back into `put`.
     pub fn getView(self: *const Store, key: []const u8) ?[]const u8 {
-        const slot = self.hash_table.lookup(&self.keys, key, self.hashOf(key)) orelse
-            return null;
-        return self.values.payload(slot.entry.val_off);
+        return switch (self.header.flags.hash) {
+            inline else => |hash_width| switch (self.header.flags.key_index) {
+                inline else => |key_width| switch (self.header.flags.value_index) {
+                    inline else => |value_width| Impl(hash_width, key_width, value_width)
+                        .getView(self, key),
+                },
+            },
+        };
     }
 
     /// Allocate a caller-owned copy of a value. Returns null without
@@ -175,34 +141,39 @@ pub const Store = struct {
         key: []const u8,
         allocator: std.mem.Allocator,
     ) !?[]u8 {
-        const slot = self.hash_table.lookup(&self.keys, key, self.hashOf(key)) orelse
-            return null;
-
-        const value = self.values.payload(slot.entry.val_off);
-        const copy = try allocator.alloc(u8, value.len);
-        @memcpy(copy, value);
-        return copy;
+        switch (self.header.flags.hash) {
+            inline else => |hash_width| switch (self.header.flags.key_index) {
+                inline else => |key_width| switch (self.header.flags.value_index) {
+                    inline else => |value_width| return Impl(hash_width, key_width, value_width)
+                        .getAlloc(self, key, allocator),
+                },
+            },
+        }
     }
 
     /// Value length, or null when the key is missing. A zero-length value
     /// returns 0 and is distinct from a missing key.
     pub fn exists(self: *const Store, key: []const u8) ?u64 {
-        const slot = self.hash_table.lookup(&self.keys, key, self.hashOf(key)) orelse
-            return null;
-        return @intCast(self.values.payload(slot.entry.val_off).len);
+        return switch (self.header.flags.hash) {
+            inline else => |hash_width| switch (self.header.flags.key_index) {
+                inline else => |key_width| switch (self.header.flags.value_index) {
+                    inline else => |value_width| Impl(hash_width, key_width, value_width)
+                        .exists(self, key),
+                },
+            },
+        };
     }
 
     /// Remove a key and free both blocks. Returns whether the key was present.
     pub fn remove(self: *Store, key: []const u8) bool {
-        const removed = self.hash_table.remove(&self.keys, key, self.hashOf(key)) orelse
-            return false;
-
-        freeBlock(&self.values, removed.entry.val_off);
-        freeBlock(&self.keys, removed.entry.key_off);
-
-        self.syncHeader();
-        self.generation += 1;
-        return true;
+        return switch (self.header.flags.hash) {
+            inline else => |hash_width| switch (self.header.flags.key_index) {
+                inline else => |key_width| switch (self.header.flags.value_index) {
+                    inline else => |value_width| Impl(hash_width, key_width, value_width)
+                        .remove(self, key),
+                },
+            },
+        };
     }
 
     /// Live entries.
@@ -241,6 +212,22 @@ pub const Store = struct {
                 return error.Corrupt;
             if (slot.index != index) return error.Corrupt;
         }
+    }
+
+    /// Mirror the runtime table/free-list state into the image header.
+    ///
+    /// The constants (magic, flags, capacities) never change after creation, so
+    /// only the three mutable words are rewritten.
+    inline fn syncHeader(self: *Store) void {
+        self.header.table_size = self.hash_table.count;
+        self.header.key_free_head = self.keys.free_head;
+        self.header.value_free_head = self.values.free_head;
+        format.Header.writeRuntimeState(
+            self.memory,
+            self.header.table_size,
+            self.header.key_free_head,
+            self.header.value_free_head,
+        );
     }
 
     /// Iterate live entries in slot order. The iterator borrows the store; its
@@ -327,28 +314,6 @@ pub const Store = struct {
         return adoptImage(buffer[0..size], null);
     }
 
-    fn hashOf(self: *const Store, key: []const u8) u64 {
-        return hash.hashKey(key, self.header.flags.hash);
-    }
-
-    fn maxKeyLen(self: *const Store) u64 {
-        return self.header.key_bytes -
-            format.blockHeaderSize(self.header.flags.key_index);
-    }
-
-    fn maxValueLen(self: *const Store) u64 {
-        return self.header.value_bytes -
-            format.blockHeaderSize(self.header.flags.value_index);
-    }
-
-    /// Mirror the runtime table/free-list state into the image header.
-    fn syncHeader(self: *Store) void {
-        self.header.table_size = self.hash_table.count;
-        self.header.key_free_head = self.keys.free_head;
-        self.header.value_free_head = self.values.free_head;
-        self.header.encode(self.memory);
-    }
-
     /// Validate an existing image and construct a store over it.
     fn adoptImage(memory: []u8, allocator: ?std.mem.Allocator) !Store {
         const validated = try image.validate(memory);
@@ -374,19 +339,16 @@ pub const Store = struct {
             memory[table_start..table_end],
             header.flags,
             header.table_reserved,
-            header.endian,
             header.table_size,
         );
         const keys = arena.Arena.init(
             memory[keys_start..keys_end],
             header.flags.key_index,
-            header.endian,
             header.key_free_head,
         );
         const values = arena.Arena.init(
             memory[keys_end..values_end],
             header.flags.value_index,
-            header.endian,
             header.value_free_head,
         );
 
@@ -410,10 +372,8 @@ pub const Store = struct {
     ) !Store {
         std.debug.assert(memory.len == @as(usize, @intCast(layout.file_size)));
 
-        const endian = format.native_endian;
         const header: format.Header = .{
             .flags = layout.flags,
-            .endian = endian,
             .table_reserved = layout.table_reserved,
             .table_size = 0,
             .key_bytes = layout.key_bytes,
@@ -433,17 +393,14 @@ pub const Store = struct {
             memory[table_start..table_end],
             layout.flags,
             layout.table_reserved,
-            endian,
         );
         const keys = try arena.Arena.initEmpty(
             memory[keys_start..keys_end],
             layout.flags.key_index,
-            endian,
         );
         const values = try arena.Arena.initEmpty(
             memory[keys_end..values_end],
             layout.flags.value_index,
-            endian,
         );
 
         return .{
@@ -460,8 +417,181 @@ pub const Store = struct {
     }
 };
 
-fn freeBlock(a: *arena.Arena, off: u64) void {
-    a.free(off) catch @panic("zigkv: arena invariant violated");
+/// Copy a payload, using an inline fixed-size move for the short sizes that
+/// dominate small key/value stores. A runtime-length `@memcpy` compiles to a
+/// `memcpy` call, which costs more than the store itself at these sizes.
+inline fn copyPayload(dst: []u8, src: []const u8) void {
+    std.debug.assert(dst.len == src.len);
+    if (src.len == 8) {
+        @as(*align(1) u64, @ptrCast(dst.ptr)).* =
+            @as(*align(1) const u64, @ptrCast(src.ptr)).*;
+    } else if (src.len == 16) {
+        @as(*align(1) u128, @ptrCast(dst.ptr)).* =
+            @as(*align(1) const u128, @ptrCast(src.ptr)).*;
+    } else {
+        @memcpy(dst, src);
+    }
+}
+
+inline fn freeBlock(comptime A: type, a: *arena.Arena, off: u64) void {
+    A.free(a, off) catch @panic("zigkv: arena invariant violated");
+}
+
+/// Fully specialized operations for one combination of field widths.
+///
+/// The public `Store` methods dispatch here exactly once; nothing in this type
+/// re-checks a width.
+fn Impl(
+    comptime hash_width: format.HashWidth,
+    comptime key_width: format.IndexWidth,
+    comptime value_width: format.IndexWidth,
+) type {
+    const Hash = hash_width;
+    const KeyArena = arena.Impl(key_width);
+    const ValueArena = arena.Impl(value_width);
+    const Table = table.Impl(hash_width, key_width, value_width);
+
+    return struct {
+        inline fn hashKey(key: []const u8) u64 {
+            return switch (Hash) {
+                .city32 => hash.city32(key),
+                .city64 => hash.city64(key),
+            };
+        }
+
+        inline fn maxKeyLen(s: *const Store) u64 {
+            return s.header.key_bytes - KeyArena.header_size;
+        }
+
+        inline fn maxValueLen(s: *const Store) u64 {
+            return s.header.value_bytes - ValueArena.header_size;
+        }
+
+        fn put(s: *Store, key: []const u8, value: []const u8) !void {
+            const hash_value = hashKey(key);
+            // One probe sequence for both the lookup and the insert position.
+            const found = try Table.probe(&s.hash_table, &s.keys, key, hash_value);
+
+            if (found.entry) |entry| {
+                const value_len: u64 = @intCast(value.len);
+                if (value_len > maxValueLen(s)) return error.ValueTooLarge;
+
+                const old_off = entry.val_off;
+                const old_size = ValueArena.sizeAt(&s.values, old_off);
+
+                if (value_len <= old_size - ValueArena.header_size) {
+                    // Keep the block: write the new payload, update `len`, and
+                    // return any tail that can hold a minimum block.
+                    if (value.len != 0) {
+                        copyPayload(
+                            ValueArena.payloadSpan(&s.values, old_off)[0..value.len],
+                            value,
+                        );
+                    }
+                    try ValueArena.shrinkToFit(&s.values, old_off, value_len);
+                } else {
+                    const block = try ValueArena.allocBlock(&s.values, value_len);
+                    errdefer freeBlock(ValueArena, &s.values, block.off);
+
+                    copyPayload(block.payload, value);
+                    Table.setValueOffset(&s.hash_table, found.index, block.off);
+                    freeBlock(ValueArena, &s.values, old_off);
+                }
+
+                s.syncHeader();
+                s.generation += 1;
+                return;
+            }
+
+            const key_len: u64 = @intCast(key.len);
+            const value_len: u64 = @intCast(value.len);
+            if (key_len > maxKeyLen(s)) return error.KeyTooLarge;
+            if (value_len > maxValueLen(s)) return error.ValueTooLarge;
+
+            // Allocate both blocks before mutating the table so an allocation
+            // failure leaves the store logically unchanged.
+            const key_block = try KeyArena.allocBlock(&s.keys, key_len);
+            errdefer freeBlock(KeyArena, &s.keys, key_block.off);
+            copyPayload(key_block.payload, key);
+
+            const value_block = try ValueArena.allocBlock(&s.values, value_len);
+            errdefer freeBlock(ValueArena, &s.values, value_block.off);
+            copyPayload(value_block.payload, value);
+
+            Table.placeAt(&s.hash_table, found.index, hash_value, key_block.off, value_block.off);
+
+            s.syncHeader();
+            s.generation += 1;
+        }
+
+        fn get(s: *const Store, key: []const u8, buffer: []u8) !?[]const u8 {
+            const val_off = Table.lookupValueOff(
+                &s.hash_table,
+                &s.keys,
+                key,
+                hashKey(key),
+            ) orelse return null;
+
+            const value = ValueArena.payloadConst(&s.values, val_off);
+            if (value.len > buffer.len) return error.BufferTooSmall;
+            @memcpy(buffer[0..value.len], value);
+            return buffer[0..value.len];
+        }
+
+        fn getView(s: *const Store, key: []const u8) ?[]const u8 {
+            const val_off = Table.lookupValueOff(
+                &s.hash_table,
+                &s.keys,
+                key,
+                hashKey(key),
+            ) orelse return null;
+            return ValueArena.payloadConst(&s.values, val_off);
+        }
+
+        fn getAlloc(
+            s: *const Store,
+            key: []const u8,
+            allocator: std.mem.Allocator,
+        ) !?[]u8 {
+            const val_off = Table.lookupValueOff(
+                &s.hash_table,
+                &s.keys,
+                key,
+                hashKey(key),
+            ) orelse return null;
+
+            const value = ValueArena.payloadConst(&s.values, val_off);
+            const copy = try allocator.alloc(u8, value.len);
+            @memcpy(copy, value);
+            return copy;
+        }
+
+        fn exists(s: *const Store, key: []const u8) ?u64 {
+            const val_off = Table.lookupValueOff(
+                &s.hash_table,
+                &s.keys,
+                key,
+                hashKey(key),
+            ) orelse return null;
+            return @intCast(ValueArena.payloadConst(&s.values, val_off).len);
+        }
+
+        fn remove(s: *Store, key: []const u8) bool {
+            const removed = Table.remove(
+                &s.hash_table,
+                &s.keys,
+                key,
+                hashKey(key),
+            ) orelse return false;
+
+            freeBlock(ValueArena, &s.values, removed.entry.val_off);
+            freeBlock(KeyArena, &s.keys, removed.entry.key_off);
+
+            s.syncHeader();
+            s.generation += 1;
+            return true;
+        }
+    };
 }
 
 /// Borrowed key/value pair yielded by `Iterator`.

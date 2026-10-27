@@ -265,7 +265,6 @@ fn runStat(io: std.Io, gpa: std.mem.Allocator, args: []const [:0]const u8) !void
     defer store.deinit();
 
     const header = store.header;
-    const byte_order = if (header.endian == .big) "big" else "little";
 
     var buffer: [4096]u8 = undefined;
     var file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
@@ -277,7 +276,6 @@ fn runStat(io: std.Io, gpa: std.mem.Allocator, args: []const [:0]const u8) !void
 
     try out.print("format: {s}\n", .{zigkv.Store.file_magic});
     try out.print("version: {d}\n", .{zigkv.Store.file_version});
-    try out.print("byte-order: {s}\n", .{byte_order});
     try out.print("hash-width: {d}\n", .{hash_bits});
     try out.print("key-index-width: {d}\n", .{key_index_bits});
     try out.print("value-index-width: {d}\n", .{value_index_bits});

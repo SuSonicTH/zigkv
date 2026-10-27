@@ -183,6 +183,9 @@ zig build example      # run the basic library example
 zig build bench -Doptimize=ReleaseFast  # benchmarks vs std maps
 ```
 
+See [docs/performance.md](docs/performance.md) for benchmark results and how
+value size affects throughput.
+
 Requires Zig 0.17.0 and a 64-bit host.
 
 ## License

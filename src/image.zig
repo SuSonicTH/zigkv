@@ -74,10 +74,10 @@ pub fn imageSize(options: Options) !u64 {
 
 /// Validate an image's structure and derive its section layout.
 ///
-/// This checks the header, flags, byte order, capacities, exact file length,
-/// load-factor accounting, both free lists (sorted, in bounds, coalesced,
-/// cycle-free), both arena tilings, and every table entry's block offsets. It
-/// never reads out of bounds on malformed input.
+/// This checks the header, flags, saved byte order, capacities, exact file
+/// length, load-factor accounting, both free lists (sorted, in bounds,
+/// coalesced, cycle-free), both arena tilings, and every table entry's block
+/// offsets. It never reads out of bounds on malformed input.
 ///
 /// Validation deliberately does not prove that a table entry points at an arena
 /// block start or that entries reference distinct blocks; see README "Known
@@ -120,12 +120,11 @@ pub fn validate(bytes: []const u8) !ValidatedImage {
         @constCast(table_memory),
         header.flags,
         header.table_reserved,
-        header.endian,
         header.table_size,
     ) catch return error.Corrupt;
 
-    try validateArena(key_memory, header.flags.key_index, header.endian, header.key_free_head);
-    try validateArena(value_memory, header.flags.value_index, header.endian, header.value_free_head);
+    try validateArena(key_memory, header.flags.key_index, header.key_free_head);
+    try validateArena(value_memory, header.flags.value_index, header.value_free_head);
     try validateEntries(table_memory, header, key_memory, value_memory);
 
     return .{ .header = header, .layout = layout };
@@ -191,14 +190,12 @@ fn align8(value: u64) !u64 {
 fn validateArena(
     memory: []const u8,
     width: format.IndexWidth,
-    endian: format.Endian,
     free_head: u64,
 ) !void {
     return switch (width) {
         inline else => |comptime_width| validateArenaImpl(
             comptime_width,
             memory,
-            endian,
             free_head,
         ),
     };
@@ -207,7 +204,6 @@ fn validateArena(
 fn validateArenaImpl(
     comptime width: format.IndexWidth,
     memory: []const u8,
-    endian: format.Endian,
     free_head: u64,
 ) !void {
     const Block = format.Block(width);
@@ -222,17 +218,17 @@ fn validateArenaImpl(
         if (cursor >= capacity or cursor % 8 != 0) return error.Corrupt;
         if (cursor + header_size > capacity) return error.Corrupt;
 
-        const size = Block.readSize(memory, @intCast(cursor), endian);
+        const size = Block.readSize(memory, @intCast(cursor));
         if (size < Block.min_size or size % 8 != 0) return error.Corrupt;
         if (size > capacity - cursor) return error.Corrupt;
 
         if (prev != Block.none) {
-            const prev_size = Block.readSize(memory, @intCast(prev), endian);
+            const prev_size = Block.readSize(memory, @intCast(prev));
             if (cursor <= prev) return error.Corrupt;
             if (prev + prev_size >= cursor) return error.Corrupt;
         }
 
-        const next = Block.readNext(memory, @intCast(cursor), endian);
+        const next = Block.readNext(memory, @intCast(cursor));
         if (next != Block.none and next <= cursor) return error.Corrupt;
 
         prev = cursor;
@@ -250,7 +246,7 @@ fn validateArenaImpl(
     while (offset < capacity) {
         if (offset + header_size > capacity) return error.Corrupt;
 
-        const size = Block.readSize(memory, @intCast(offset), endian);
+        const size = Block.readSize(memory, @intCast(offset));
         if (size < Block.min_size or size % 8 != 0) return error.Corrupt;
         if (size > capacity - offset) return error.Corrupt;
 
@@ -258,14 +254,14 @@ fn validateArenaImpl(
             if (free_cursor < offset) return error.Corrupt;
 
             if (free_cursor == offset) {
-                const next = Block.readNext(memory, @intCast(free_cursor), endian);
+                const next = Block.readNext(memory, @intCast(free_cursor));
                 if (next != Block.none and next <= offset + size) return error.Corrupt;
                 free_cursor = next;
             } else {
-                try validateAllocatedBlock(Block, memory, endian, offset, size);
+                try validateAllocatedBlock(Block, memory, offset, size);
             }
         } else {
-            try validateAllocatedBlock(Block, memory, endian, offset, size);
+            try validateAllocatedBlock(Block, memory, offset, size);
         }
 
         offset += size;
@@ -280,12 +276,11 @@ fn validateArenaImpl(
 fn validateAllocatedBlock(
     comptime Block: type,
     memory: []const u8,
-    endian: format.Endian,
     offset: u64,
     size: u64,
 ) !void {
     const header_size: u64 = @intCast(Block.header_size);
-    const len = Block.readLen(memory, @intCast(offset), endian);
+    const len = Block.readLen(memory, @intCast(offset));
     if (len > size - header_size) return error.Corrupt;
 }
 
@@ -299,7 +294,6 @@ fn validateEntries(
         @constCast(table_memory),
         header.flags,
         header.table_reserved,
-        header.endian,
         header.table_size,
     );
 
@@ -313,13 +307,11 @@ fn validateEntries(
         _ = try validateBlock(
             key_memory,
             header.flags.key_index,
-            header.endian,
             entry.key_off,
         );
         _ = try validateBlock(
             value_memory,
             header.flags.value_index,
-            header.endian,
             entry.val_off,
         );
     }
@@ -331,14 +323,12 @@ fn validateEntries(
 fn validateBlock(
     memory: []const u8,
     width: format.IndexWidth,
-    endian: format.Endian,
     offset: u64,
 ) !u64 {
     return switch (width) {
         inline else => |comptime_width| validateBlockImpl(
             comptime_width,
             memory,
-            endian,
             offset,
         ),
     };
@@ -347,7 +337,6 @@ fn validateBlock(
 fn validateBlockImpl(
     comptime width: format.IndexWidth,
     memory: []const u8,
-    endian: format.Endian,
     offset: u64,
 ) !u64 {
     const Block = format.Block(width);
@@ -357,11 +346,11 @@ fn validateBlockImpl(
     if (offset >= capacity or offset % 8 != 0) return error.Corrupt;
     if (offset + header_size > capacity) return error.Corrupt;
 
-    const size = Block.readSize(memory, @intCast(offset), endian);
+    const size = Block.readSize(memory, @intCast(offset));
     if (size < Block.min_size or size % 8 != 0) return error.Corrupt;
     if (size > capacity - offset) return error.Corrupt;
 
-    const len = Block.readLen(memory, @intCast(offset), endian);
+    const len = Block.readLen(memory, @intCast(offset));
     if (len > size - header_size) return error.Corrupt;
     return len;
 }

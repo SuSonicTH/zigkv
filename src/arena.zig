@@ -13,21 +13,25 @@ pub const Arena = struct {
     /// The arena section of the image. Offsets used by this API are relative
     /// to this slice.
     memory: []u8,
-    endian: format.Endian,
     width: format.IndexWidth,
     /// Offset of the first free block, or `NONE`.
     free_head: u64,
+
+    /// A freshly allocated block: its offset (for the table entry and for
+    /// `free`) and its payload slice.
+    pub const Allocation = struct {
+        off: u64,
+        payload: []u8,
+    };
 
     /// Attach to an existing, already-validated arena without modifying it.
     pub fn init(
         memory: []u8,
         width: format.IndexWidth,
-        endian: format.Endian,
         free_head: u64,
     ) Arena {
         return .{
             .memory = memory,
-            .endian = endian,
             .width = width,
             .free_head = free_head,
         };
@@ -39,7 +43,6 @@ pub const Arena = struct {
     pub fn initEmpty(
         memory: []u8,
         width: format.IndexWidth,
-        endian: format.Endian,
     ) !Arena {
         if (memory.len < format.blockHeaderSize(width)) return error.Corrupt;
         if (memory.len % 8 != 0) return error.Corrupt;
@@ -49,13 +52,11 @@ pub const Arena = struct {
 
         var result = Arena{
             .memory = memory,
-            .endian = endian,
             .width = width,
             .free_head = 0,
         };
         switch (width) {
-            .u32 => Impl(.u32).writeEmpty(&result),
-            .u64 => Impl(.u64).writeEmpty(&result),
+            inline else => |w| Impl(w).writeEmpty(&result),
         }
         return result;
     }
@@ -68,8 +69,15 @@ pub const Arena = struct {
     /// offset. The block may be larger than requested at the end of the arena.
     pub fn alloc(self: *Arena, len: u64) !u64 {
         return switch (self.width) {
-            .u32 => Impl(.u32).alloc(self, len),
-            .u64 => Impl(.u64).alloc(self, len),
+            inline else => |w| Impl(w).alloc(self, len),
+        };
+    }
+
+    /// Allocate a block and return its offset and payload slice, avoiding a
+    /// second header read after `alloc`.
+    pub fn allocBlock(self: *Arena, len: u64) !Allocation {
+        return switch (self.width) {
+            inline else => |w| Impl(w).allocBlock(self, len),
         };
     }
 
@@ -77,32 +85,28 @@ pub const Arena = struct {
     /// keeps the free list sorted by offset.
     pub fn free(self: *Arena, off: u64) !void {
         return switch (self.width) {
-            .u32 => Impl(.u32).free(self, off),
-            .u64 => Impl(.u64).free(self, off),
+            inline else => |w| Impl(w).free(self, off),
         };
     }
 
     /// Total block size, including the header and padding.
     pub fn blockSize(self: *const Arena, off: u64) u64 {
         return switch (self.width) {
-            .u32 => Impl(.u32).sizeAt(self, off),
-            .u64 => Impl(.u64).sizeAt(self, off),
+            inline else => |w| Impl(w).sizeAt(self, off),
         };
     }
 
     /// Borrowed payload of an allocated block.
     pub fn payload(self: *const Arena, off: u64) []const u8 {
         return switch (self.width) {
-            .u32 => Impl(.u32).payloadConst(self, off),
-            .u64 => Impl(.u64).payloadConst(self, off),
+            inline else => |w| Impl(w).payloadConst(self, off),
         };
     }
 
     /// Mutable payload of an allocated block.
     pub fn payloadMut(self: *Arena, off: u64) []u8 {
         return switch (self.width) {
-            .u32 => Impl(.u32).payloadMutable(self, off),
-            .u64 => Impl(.u64).payloadMutable(self, off),
+            inline else => |w| Impl(w).payloadMutable(self, off),
         };
     }
 
@@ -110,8 +114,7 @@ pub const Arena = struct {
     /// the end of the block (payload plus padding). Used for in-place growth.
     pub fn payloadSpan(self: *Arena, off: u64) []u8 {
         return switch (self.width) {
-            .u32 => Impl(.u32).payloadSpan(self, off),
-            .u64 => Impl(.u64).payloadSpan(self, off),
+            inline else => |w| Impl(w).payloadSpan(self, off),
         };
     }
 
@@ -120,79 +123,83 @@ pub const Arena = struct {
     /// already be written.
     pub fn shrinkToFit(self: *Arena, off: u64, new_len: u64) !void {
         return switch (self.width) {
-            .u32 => Impl(.u32).shrinkToFit(self, off, new_len),
-            .u64 => Impl(.u64).shrinkToFit(self, off, new_len),
+            inline else => |w| Impl(w).shrinkToFit(self, off, new_len),
         };
     }
 };
 
-fn Impl(comptime width: format.IndexWidth) type {
+/// Operations for one index width. Public so callers that already know the
+/// width at compile time (for example `Store`) can skip the per-call dispatch.
+pub fn Impl(comptime width: format.IndexWidth) type {
     const Block = format.Block(width);
 
     return struct {
-        fn pos(off: u64) usize {
+        pub const header_size: u64 = @intCast(Block.header_size);
+
+        inline fn pos(off: u64) usize {
             return @intCast(off);
         }
 
-        fn capacity(self: *const Arena) u64 {
+        pub inline fn capacity(self: *const Arena) u64 {
             return @intCast(self.memory.len);
         }
 
-        fn sizeAt(self: *const Arena, off: u64) u64 {
-            return Block.readSize(self.memory, pos(off), self.endian);
+        pub inline fn sizeAt(self: *const Arena, off: u64) u64 {
+            return Block.readSize(self.memory, pos(off));
         }
 
-        fn nextAt(self: *const Arena, off: u64) u64 {
-            return Block.readNext(self.memory, pos(off), self.endian);
+        inline fn nextAt(self: *const Arena, off: u64) u64 {
+            return Block.readNext(self.memory, pos(off));
         }
 
-        fn lenAt(self: *const Arena, off: u64) u64 {
-            return Block.readLen(self.memory, pos(off), self.endian);
+        inline fn lenAt(self: *const Arena, off: u64) u64 {
+            return Block.readLen(self.memory, pos(off));
         }
 
-        fn writeEmpty(self: *Arena) void {
-            Block.writeSize(self.memory, 0, @intCast(self.memory.len), self.endian);
-            Block.writeNext(self.memory, 0, Block.none, self.endian);
+        pub fn writeEmpty(self: *Arena) void {
+            Block.writeSize(self.memory, 0, @intCast(self.memory.len));
+            Block.writeNext(self.memory, 0, Block.none);
         }
 
-        fn alloc(self: *Arena, len: u64) !u64 {
-            const need = try alignNeeded(len, @intCast(Block.header_size), capacity(self));
+        pub fn alloc(self: *Arena, len: u64) !u64 {
+            const cap = capacity(self);
+            const need = try alignNeeded(len, header_size, cap);
 
             var prev: u64 = Block.none;
             var cur = self.free_head;
             while (cur != Block.none) {
-                std.debug.assert(cur < capacity(self));
+                std.debug.assert(cur < cap);
                 std.debug.assert(cur % 8 == 0);
 
                 const size = sizeAt(self, cur);
                 const next = nextAt(self, cur);
                 std.debug.assert(size >= Block.min_size);
                 std.debug.assert(size % 8 == 0);
-                std.debug.assert(size <= capacity(self) - cur);
+                std.debug.assert(size <= cap - cur);
 
                 if (size >= need) {
                     if (size - need >= Block.min_size) {
                         // Keep the block here, move the free remainder after it.
                         const remainder = cur + need;
-                        Block.writeSize(self.memory, pos(remainder), size - need, self.endian);
-                        Block.writeNext(self.memory, pos(remainder), next, self.endian);
+                        Block.writeSize(self.memory, pos(remainder), size - need);
+                        Block.writeNext(self.memory, pos(remainder), next);
                         if (prev == Block.none) {
                             self.free_head = remainder;
                         } else {
-                            Block.writeNext(self.memory, pos(prev), remainder, self.endian);
+                            Block.writeNext(self.memory, pos(prev), remainder);
                         }
-                        Block.writeSize(self.memory, pos(cur), need, self.endian);
+                        Block.writeSize(self.memory, pos(cur), need);
                     } else {
                         // The tail is too small to become a block; consume it
                         // and keep the original, larger block size.
                         if (prev == Block.none) {
                             self.free_head = next;
                         } else {
-                            Block.writeNext(self.memory, pos(prev), next, self.endian);
+                            Block.writeNext(self.memory, pos(prev), next);
                         }
                     }
 
-                    Block.writeLen(self.memory, pos(cur), len, self.endian);
+                    Block.writeLen(self.memory, pos(cur), len);
                     return cur;
                 }
 
@@ -203,7 +210,16 @@ fn Impl(comptime width: format.IndexWidth) type {
             return error.OutOfSpace;
         }
 
-        fn free(self: *Arena, off: u64) !void {
+        pub inline fn allocBlock(self: *Arena, len: u64) !Arena.Allocation {
+            const off = try alloc(self, len);
+            const start = pos(off) + Block.header_size;
+            return .{
+                .off = off,
+                .payload = self.memory[start..][0..@intCast(len)],
+            };
+        }
+
+        pub fn free(self: *Arena, off: u64) !void {
             const cap = capacity(self);
             if (off >= cap or off % 8 != 0) return error.Corrupt;
 
@@ -244,40 +260,39 @@ fn Impl(comptime width: format.IndexWidth) type {
             }
 
             if (merge_prev) {
-                Block.writeSize(self.memory, pos(prev), merged_size, self.endian);
-                Block.writeNext(self.memory, pos(prev), merged_next, self.endian);
+                Block.writeSize(self.memory, pos(prev), merged_size);
+                Block.writeNext(self.memory, pos(prev), merged_next);
             } else {
-                Block.writeSize(self.memory, pos(off), merged_size, self.endian);
-                Block.writeNext(self.memory, pos(off), merged_next, self.endian);
+                Block.writeSize(self.memory, pos(off), merged_size);
+                Block.writeNext(self.memory, pos(off), merged_next);
                 if (prev == Block.none) {
                     self.free_head = off;
                 } else {
-                    Block.writeNext(self.memory, pos(prev), off, self.endian);
+                    Block.writeNext(self.memory, pos(prev), off);
                 }
             }
         }
 
-        fn payloadConst(self: *const Arena, off: u64) []const u8 {
+        pub inline fn payloadConst(self: *const Arena, off: u64) []const u8 {
             const start = pos(off) + Block.header_size;
             const len = lenAt(self, off);
             return self.memory[start..][0..@intCast(len)];
         }
 
-        fn payloadMutable(self: *Arena, off: u64) []u8 {
+        pub inline fn payloadMutable(self: *Arena, off: u64) []u8 {
             const start = pos(off) + Block.header_size;
             const len = lenAt(self, off);
             return self.memory[start..][0..@intCast(len)];
         }
 
-        fn payloadSpan(self: *Arena, off: u64) []u8 {
-            const span_len = sizeAt(self, off) - @as(u64, @intCast(Block.header_size));
+        pub inline fn payloadSpan(self: *Arena, off: u64) []u8 {
+            const span_len = sizeAt(self, off) - header_size;
             const start = pos(off) + Block.header_size;
             return self.memory[start..][0..@intCast(span_len)];
         }
 
-        fn shrinkToFit(self: *Arena, off: u64, new_len: u64) !void {
+        pub fn shrinkToFit(self: *Arena, off: u64, new_len: u64) !void {
             const size = sizeAt(self, off);
-            const header_size: u64 = @intCast(Block.header_size);
             if (new_len > size - header_size) return error.Corrupt;
 
             const needed = try alignNeeded(new_len, header_size, capacity(self));
@@ -285,12 +300,12 @@ fn Impl(comptime width: format.IndexWidth) type {
 
             const tail = size - needed;
             if (tail >= Block.min_size) {
-                Block.writeSize(self.memory, pos(off + needed), tail, self.endian);
-                Block.writeSize(self.memory, pos(off), needed, self.endian);
-                Block.writeLen(self.memory, pos(off), new_len, self.endian);
+                Block.writeSize(self.memory, pos(off + needed), tail);
+                Block.writeSize(self.memory, pos(off), needed);
+                Block.writeLen(self.memory, pos(off), new_len);
                 try free(self, off + needed);
             } else {
-                Block.writeLen(self.memory, pos(off), new_len, self.endian);
+                Block.writeLen(self.memory, pos(off), new_len);
             }
         }
     };

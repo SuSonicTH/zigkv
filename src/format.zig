@@ -1,14 +1,15 @@
-//! Byte-level file format definitions: constants, flags and byte-order
-//! bootstrap, header accessors, table entries, and key/value block accessors.
+//! Byte-level file format definitions: constants, flags, header accessors,
+//! table entries, and key/value block accessors.
 //!
 //! Every multi-byte field is accessed with `std.mem.readInt` / `writeInt`, so
-//! the store buffer has no alignment requirement. Integers use the image's
-//! declared byte order.
+//! the store buffer has no alignment requirement. Integers are always read and
+//! written in the host's native byte order. An image records the byte order it
+//! was created with so that `Header.decode` can reject an image created on a
+//! host with a different byte order.
 
 const std = @import("std");
 
-pub const Endian = std.lang.Endian;
-pub const native_endian = Endian.native;
+const host_is_big = std.lang.Endian.native == .big;
 
 /// ASCII magic; the `001` suffix is the file-format version.
 pub const magic = "zigkv001";
@@ -104,15 +105,19 @@ pub fn arenaNone(width: IndexWidth) u64 {
 /// | 2   | value index width (0 = 32, 1 = 64) |
 /// | 3   | data byte order (0 = LE, 1 = BE) |
 /// | 59  | duplicate of bit 3               |
+///
+/// A byte swap maps bit 3 to bit 59 and bit 59 to bit 3, so both copies hold
+/// the same value when the word is read natively regardless of the image's byte
+/// order. `Header.decode` reads bit 3 to recover the order the image was saved
+/// in.
 pub const Flags = struct {
     hash: HashWidth = .city64,
     key_index: IndexWidth = .u32,
     value_index: IndexWidth = .u32,
 
-    /// Build the flags word, serializing the byte-order bit into both copies.
-    /// The caller writes the returned word in `order`.
-    pub fn encode(self: Flags, order: Endian) u64 {
-        const order_bit: u64 = if (order == .big) 1 else 0;
+    /// Build the flags word in the host's byte order.
+    pub fn encode(self: Flags) u64 {
+        const order_bit: u64 = if (host_is_big) 1 else 0;
         const hash_bit: u64 = if (self.hash == .city64) 1 else 0;
         const key_bit: u64 = if (self.key_index == .u64) 1 else 0;
         const value_bit: u64 = if (self.value_index == .u64) 1 else 0;
@@ -123,12 +128,11 @@ pub const Flags = struct {
             (order_bit << 59);
     }
 
-    /// Decode and validate a flags word. Reserved bits must be zero and the
-    /// two byte-order copies must agree.
+    /// Decode and validate a natively read flags word. Reserved bits must be
+    /// zero. The saved byte order has already been checked by `Header.decode`.
     pub fn decode(word: u64) !Flags {
         const allowed: u64 = 0b111 | (@as(u64, 1) << 3) | (@as(u64, 1) << 59);
         if ((word & ~allowed) != 0) return error.Corrupt;
-        if (((word >> 3) & 1) != ((word >> 59) & 1)) return error.Corrupt;
 
         return .{
             .hash = if ((word & 1) != 0) .city64 else .city32,
@@ -136,23 +140,10 @@ pub const Flags = struct {
             .value_index = if (((word >> 2) & 1) != 0) .u64 else .u32,
         };
     }
-
-    /// Determine a file's byte order from the duplicated flag bit without
-    /// decoding any other field. Bit 3 of the flags word lands in byte 8 under
-    /// a little-endian read and byte 15 under a big-endian read.
-    pub fn detectEndian(bytes: []const u8) !Endian {
-        if (bytes.len < header_size) return error.Corrupt;
-
-        const lo = (bytes[field.flags] >> 3) & 1;
-        const hi = (bytes[field.flags + 7] >> 3) & 1;
-        if (lo != hi) return error.Corrupt;
-        return if (lo == 1) .big else .little;
-    }
 };
 
 pub const Header = struct {
     flags: Flags,
-    endian: Endian = native_endian,
     table_reserved: u64,
     table_size: u64,
     key_bytes: u64,
@@ -160,27 +151,27 @@ pub const Header = struct {
     value_bytes: u64,
     value_free_head: u64,
 
-    /// Parse a header from at least 64 bytes. Validates the magic/version, the
-    /// byte-order bootstrap and the flags word. Structural validation of the
-    /// remaining fields belongs to the image layer.
+    /// Parse a header from at least 64 bytes. Validates the magic/version, that
+    /// the image's saved byte order matches the host, and the flags word.
+    /// Structural validation of the remaining fields belongs to the image layer.
     pub fn decode(bytes: []const u8) !Header {
         if (bytes.len < header_size) return error.Corrupt;
         if (!std.mem.eql(u8, bytes[field.magic..][0..magic.len], magic)) {
             return error.UnsupportedVersion;
         }
 
-        const order = try Flags.detectEndian(bytes);
-        if (order != native_endian) return error.UnsupportedEndianness;
+        const flags_word = readU64(bytes, field.flags);
+        const saved_big = (flags_word & (@as(u64, 1) << 3)) != 0;
+        if (saved_big != host_is_big) return error.UnsupportedEndianness;
 
         return .{
-            .flags = try Flags.decode(readU64(bytes, field.flags, order)),
-            .endian = order,
-            .table_reserved = readU64(bytes, field.table_reserved, order),
-            .table_size = readU64(bytes, field.table_size, order),
-            .key_bytes = readU64(bytes, field.key_bytes, order),
-            .key_free_head = readU64(bytes, field.key_free_head, order),
-            .value_bytes = readU64(bytes, field.value_bytes, order),
-            .value_free_head = readU64(bytes, field.value_free_head, order),
+            .flags = try Flags.decode(flags_word),
+            .table_reserved = readU64(bytes, field.table_reserved),
+            .table_size = readU64(bytes, field.table_size),
+            .key_bytes = readU64(bytes, field.key_bytes),
+            .key_free_head = readU64(bytes, field.key_free_head),
+            .value_bytes = readU64(bytes, field.value_bytes),
+            .value_free_head = readU64(bytes, field.value_free_head),
         };
     }
 
@@ -188,13 +179,28 @@ pub const Header = struct {
     pub fn encode(self: Header, out: []u8) void {
         std.debug.assert(out.len >= header_size);
         @memcpy(out[field.magic..][0..magic.len], magic);
-        writeU64(out, field.flags, self.flags.encode(self.endian), self.endian);
-        writeU64(out, field.table_reserved, self.table_reserved, self.endian);
-        writeU64(out, field.table_size, self.table_size, self.endian);
-        writeU64(out, field.key_bytes, self.key_bytes, self.endian);
-        writeU64(out, field.key_free_head, self.key_free_head, self.endian);
-        writeU64(out, field.value_bytes, self.value_bytes, self.endian);
-        writeU64(out, field.value_free_head, self.value_free_head, self.endian);
+        writeU64(out, field.flags, self.flags.encode());
+        writeU64(out, field.table_reserved, self.table_reserved);
+        writeU64(out, field.table_size, self.table_size);
+        writeU64(out, field.key_bytes, self.key_bytes);
+        writeU64(out, field.key_free_head, self.key_free_head);
+        writeU64(out, field.value_bytes, self.value_bytes);
+        writeU64(out, field.value_free_head, self.value_free_head);
+    }
+
+    /// Write only the fields that change while a store is live. The constants
+    /// never change, so this keeps the encoded header valid after every
+    /// mutation without re-encoding them.
+    pub fn writeRuntimeState(
+        out: []u8,
+        table_size: u64,
+        key_free_head: u64,
+        value_free_head: u64,
+    ) void {
+        std.debug.assert(out.len >= header_size);
+        writeU64(out, field.table_size, table_size);
+        writeU64(out, field.key_free_head, key_free_head);
+        writeU64(out, field.value_free_head, value_free_head);
     }
 };
 
@@ -223,22 +229,30 @@ pub fn TableEntry(
 
         pub const Fields = EntryFields;
 
-        pub fn read(bytes: []const u8, pos: usize, order: Endian) Fields {
+        pub fn read(bytes: []const u8, pos: usize) Fields {
             return .{
-                .hash = std.mem.readInt(HashInt, bytes[pos..][0..@sizeOf(HashInt)], order),
-                .key_off = std.mem.readInt(KeyInt, bytes[pos + key_offset ..][0..@sizeOf(KeyInt)], order),
-                .val_off = std.mem.readInt(ValueInt, bytes[pos + value_offset ..][0..@sizeOf(ValueInt)], order),
+                .hash = std.mem.readInt(HashInt, bytes[pos..][0..@sizeOf(HashInt)], .native),
+                .key_off = std.mem.readInt(KeyInt, bytes[pos + key_offset ..][0..@sizeOf(KeyInt)], .native),
+                .val_off = std.mem.readInt(ValueInt, bytes[pos + value_offset ..][0..@sizeOf(ValueInt)], .native),
             };
         }
 
-        pub fn write(bytes: []u8, pos: usize, fields: Fields, order: Endian) void {
-            std.mem.writeInt(HashInt, bytes[pos..][0..@sizeOf(HashInt)], @intCast(fields.hash), order);
-            std.mem.writeInt(KeyInt, bytes[pos + key_offset ..][0..@sizeOf(KeyInt)], @intCast(fields.key_off), order);
-            std.mem.writeInt(ValueInt, bytes[pos + value_offset ..][0..@sizeOf(ValueInt)], @intCast(fields.val_off), order);
+        pub fn write(bytes: []u8, pos: usize, fields: Fields) void {
+            std.mem.writeInt(HashInt, bytes[pos..][0..@sizeOf(HashInt)], @intCast(fields.hash), .native);
+            std.mem.writeInt(KeyInt, bytes[pos + key_offset ..][0..@sizeOf(KeyInt)], @intCast(fields.key_off), .native);
+            std.mem.writeInt(ValueInt, bytes[pos + value_offset ..][0..@sizeOf(ValueInt)], @intCast(fields.val_off), .native);
         }
 
-        pub fn readHash(bytes: []const u8, pos: usize, order: Endian) u64 {
-            return std.mem.readInt(HashInt, bytes[pos..][0..@sizeOf(HashInt)], order);
+        pub fn readHash(bytes: []const u8, pos: usize) u64 {
+            return std.mem.readInt(HashInt, bytes[pos..][0..@sizeOf(HashInt)], .native);
+        }
+
+        pub fn readKeyOff(bytes: []const u8, pos: usize) u64 {
+            return std.mem.readInt(KeyInt, bytes[pos + key_offset ..][0..@sizeOf(KeyInt)], .native);
+        }
+
+        pub fn readValOff(bytes: []const u8, pos: usize) u64 {
+            return std.mem.readInt(ValueInt, bytes[pos + value_offset ..][0..@sizeOf(ValueInt)], .native);
         }
     };
 }
@@ -256,30 +270,30 @@ pub fn Block(comptime width: IndexWidth) type {
         /// with a valid block offset; offset 0 remains valid.
         pub const none: u64 = std.math.maxInt(Int);
 
-        pub fn readSize(bytes: []const u8, pos: usize, order: Endian) u64 {
-            return std.mem.readInt(Int, bytes[pos..][0..@sizeOf(Int)], order);
+        pub fn readSize(bytes: []const u8, pos: usize) u64 {
+            return std.mem.readInt(Int, bytes[pos..][0..@sizeOf(Int)], .native);
         }
 
-        pub fn writeSize(bytes: []u8, pos: usize, value: u64, order: Endian) void {
-            std.mem.writeInt(Int, bytes[pos..][0..@sizeOf(Int)], @intCast(value), order);
+        pub fn writeSize(bytes: []u8, pos: usize, value: u64) void {
+            std.mem.writeInt(Int, bytes[pos..][0..@sizeOf(Int)], @intCast(value), .native);
         }
 
         /// `len` for an allocated block, at the second word of the header.
-        pub fn readLen(bytes: []const u8, pos: usize, order: Endian) u64 {
-            return std.mem.readInt(Int, bytes[pos + @sizeOf(Int) ..][0..@sizeOf(Int)], order);
+        pub fn readLen(bytes: []const u8, pos: usize) u64 {
+            return std.mem.readInt(Int, bytes[pos + @sizeOf(Int) ..][0..@sizeOf(Int)], .native);
         }
 
-        pub fn writeLen(bytes: []u8, pos: usize, value: u64, order: Endian) void {
-            std.mem.writeInt(Int, bytes[pos + @sizeOf(Int) ..][0..@sizeOf(Int)], @intCast(value), order);
+        pub fn writeLen(bytes: []u8, pos: usize, value: u64) void {
+            std.mem.writeInt(Int, bytes[pos + @sizeOf(Int) ..][0..@sizeOf(Int)], @intCast(value), .native);
         }
 
         /// `next` for a free block, at the second word of the header.
-        pub fn readNext(bytes: []const u8, pos: usize, order: Endian) u64 {
-            return std.mem.readInt(Int, bytes[pos + @sizeOf(Int) ..][0..@sizeOf(Int)], order);
+        pub fn readNext(bytes: []const u8, pos: usize) u64 {
+            return std.mem.readInt(Int, bytes[pos + @sizeOf(Int) ..][0..@sizeOf(Int)], .native);
         }
 
-        pub fn writeNext(bytes: []u8, pos: usize, value: u64, order: Endian) void {
-            std.mem.writeInt(Int, bytes[pos + @sizeOf(Int) ..][0..@sizeOf(Int)], @intCast(value), order);
+        pub fn writeNext(bytes: []u8, pos: usize, value: u64) void {
+            std.mem.writeInt(Int, bytes[pos + @sizeOf(Int) ..][0..@sizeOf(Int)], @intCast(value), .native);
         }
     };
 }
@@ -292,10 +306,10 @@ pub fn indexInt(comptime width: IndexWidth) type {
     };
 }
 
-fn readU64(bytes: []const u8, pos: usize, order: Endian) u64 {
-    return std.mem.readInt(u64, bytes[pos..][0..8], order);
+fn readU64(bytes: []const u8, pos: usize) u64 {
+    return std.mem.readInt(u64, bytes[pos..][0..8], .native);
 }
 
-fn writeU64(bytes: []u8, pos: usize, value: u64, order: Endian) void {
-    std.mem.writeInt(u64, bytes[pos..][0..8], value, order);
+fn writeU64(bytes: []u8, pos: usize, value: u64) void {
+    std.mem.writeInt(u64, bytes[pos..][0..8], value, .native);
 }

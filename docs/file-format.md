@@ -4,9 +4,10 @@ A zigkv image is a single contiguous byte sequence. It is the same memory the
 store operates on: `save` writes the image directly and `load` reads and
 validates it without a serialization pass.
 
-All multi-byte integers use the byte order declared in the header. A store is
-created in the host's native byte order; an image created on a host with a
-different byte order is rejected with `error.UnsupportedEndianness`.
+All multi-byte integers are stored in the host's native byte order. The header
+records the byte order the image was created with. A store created on a host
+with a different byte order is rejected on load with
+`error.UnsupportedEndianness`; no byte swapping or other conversion is done.
 
 ```
 
@@ -47,25 +48,21 @@ magic `zigkv001`. The `001` suffix is the file-format version.
 | 59  | duplicate of bit 3                                 |
 | all others | reserved, must be zero                       |
 
-The duplicated byte-order bit is the bootstrap. For a flags word stored in the
-file's byte order, bit 3 appears in byte 8 when read as little-endian and in
-byte 15 when read as big-endian. Both bytes carry the same bit in a valid image,
-so the loader can determine the file's byte order before decoding any other
-field:
+Bit 3 records the data byte order. Bit 59 duplicates it: a byte swap maps bit 3
+to bit 59 and bit 59 to bit 3, so a natively-read flags word exposes the saved
+order in bit 3 regardless of the image's byte order. The loader reads the flags
+word natively and performs the only byte-order check:
 
 ```text
-lo = (bytes[8]  >> 3) & 1
-hi = (bytes[15] >> 3) & 1
+saved_big = (flags_word >> 3) & 1
+host_big  = host is big-endian
 
-if lo != hi            -> error.Corrupt
-if lo == 1             -> big-endian
-else                   -> little-endian
-
-if file order != host order -> error.UnsupportedEndianness
+if saved_big != host_big -> error.UnsupportedEndianness
 ```
 
-After bootstrapping, the loader reads the complete flags word in the file's byte
-order and requires bit 3 == bit 59 and all reserved bits to be zero.
+Matching images are decoded and used directly in the host's byte order. Field
+widths are read from the same natively-read flags word; all reserved bits must
+be zero.
 
 `table_reserved` must be a power of two and at least 16. `table_size` must not
 exceed `table_reserved * 3 / 4`.
@@ -152,19 +149,19 @@ previous block, the next block, or both.
 
 `load` and `loadInto` validate the image structure before returning a store:
 
-1. length at least 64 bytes, magic/version, and byte-order bootstrap;
-2. flags: reserved bits, duplicated endian bit, supported field widths;
-3. host byte order;
-4. slot count power-of-two and at least 16, with overflow-checked layout math;
-5. arena capacities, alignment, and width limits;
-6. exact image length;
-7. load-factor accounting;
-8. free-list bounds, alignment, sortedness, coalescing, and cycle-freedom;
-9. arena tiling from offset 0 to capacity, with valid block sizes and payload
+1. length at least 64 bytes, magic/version, and the saved byte order matching
+   the host;
+2. flags: reserved bits and supported field widths;
+3. slot count power-of-two and at least 16, with overflow-checked layout math;
+4. arena capacities, alignment, and width limits;
+5. exact image length;
+6. load-factor accounting;
+7. free-list bounds, alignment, sortedness, coalescing, and cycle-freedom;
+8. arena tiling from offset 0 to capacity, with valid block sizes and payload
    lengths;
-10. every live table entry has in-bounds, 8-aligned key/value offsets and a valid
-    block header and payload length at that offset, and the live-entry count
-    matches `table_size`.
+9. every live table entry has in-bounds, 8-aligned key/value offsets and a valid
+   block header and payload length at that offset, and the live-entry count
+   matches `table_size`.
 
 `Store.verify` additionally re-hashes every live key and confirms that it is
 reachable from its home slot.

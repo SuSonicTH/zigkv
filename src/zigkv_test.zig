@@ -38,7 +38,6 @@ test "header round-trips across all width combinations" {
                 try std.testing.expectEqual(hash, decoded.flags.hash);
                 try std.testing.expectEqual(key_index, decoded.flags.key_index);
                 try std.testing.expectEqual(value_index, decoded.flags.value_index);
-                try std.testing.expectEqual(format.Endian.native, decoded.endian);
                 try std.testing.expectEqual(header.table_reserved, decoded.table_reserved);
                 try std.testing.expectEqual(header.table_size, decoded.table_size);
                 try std.testing.expectEqual(header.key_bytes, decoded.key_bytes);
@@ -48,67 +47,49 @@ test "header round-trips across all width combinations" {
 
                 try std.testing.expectEqualStrings(format.magic, bytes[0..format.magic.len]);
                 try std.testing.expectEqual(
-                    header.flags.encode(format.Endian.native),
-                    std.mem.readInt(u64, bytes[format.field.flags..][0..8], format.Endian.native),
+                    header.flags.encode(),
+                    std.mem.readInt(u64, bytes[format.field.flags..][0..8], .native),
                 );
             }
         }
     }
 }
 
-test "flags word encodes widths and both byte-order bits" {
+test "flags word encodes widths and the saved byte order" {
+    const order_bit: u64 = if (std.lang.Endian.native == .big) 1 else 0;
+    const order_bits = (order_bit << 3) | (order_bit << 59);
+
     const all_u64: format.Flags = .{
         .hash = .city64,
         .key_index = .u64,
         .value_index = .u64,
     };
-    try std.testing.expectEqual(@as(u64, 0b111), all_u64.encode(.little));
-    try std.testing.expectEqual(
-        @as(u64, 0b111) | (@as(u64, 1) << 3) | (@as(u64, 1) << 59),
-        all_u64.encode(.big),
-    );
+    try std.testing.expectEqual(@as(u64, 0b111) | order_bits, all_u64.encode());
 
     const all_32: format.Flags = .{
         .hash = .city32,
         .key_index = .u32,
         .value_index = .u32,
     };
-    try std.testing.expectEqual(@as(u64, 0), all_32.encode(.little));
+    try std.testing.expectEqual(order_bits, all_32.encode());
 
     const default_flags: format.Flags = .{};
-    try std.testing.expectEqual(@as(u64, 1), default_flags.encode(.little));
+    try std.testing.expectEqual(@as(u64, 1) | order_bits, default_flags.encode());
 
-    const decoded = try format.Flags.decode(all_u64.encode(.big));
+    const decoded = try format.Flags.decode(all_u64.encode());
     try std.testing.expectEqual(format.HashWidth.city64, decoded.hash);
     try std.testing.expectEqual(format.IndexWidth.u64, decoded.key_index);
     try std.testing.expectEqual(format.IndexWidth.u64, decoded.value_index);
 }
 
-test "flags decoding rejects reserved bits and mismatched duplicates" {
+test "flags decoding rejects reserved bits" {
     try std.testing.expectError(error.Corrupt, format.Flags.decode(@as(u64, 1) << 4));
-    try std.testing.expectError(error.Corrupt, format.Flags.decode(@as(u64, 1) << 3));
-    try std.testing.expectError(error.Corrupt, format.Flags.decode(@as(u64, 1) << 59));
     try std.testing.expectError(error.Corrupt, format.Flags.decode(@as(u64, 1) << 60));
 
     _ = try format.Flags.decode((@as(u64, 1) << 3) | (@as(u64, 1) << 59));
 }
 
-test "byte-order bootstrap detects both orders and mismatched copies" {
-    var bytes: [format.header_size]u8 = @splat(0);
-    const flags: format.Flags = .{};
-
-    std.mem.writeInt(u64, bytes[format.field.flags..][0..8], flags.encode(.little), .little);
-    try std.testing.expectEqual(format.Endian.little, try format.Flags.detectEndian(&bytes));
-
-    std.mem.writeInt(u64, bytes[format.field.flags..][0..8], flags.encode(.big), .big);
-    try std.testing.expectEqual(format.Endian.big, try format.Flags.detectEndian(&bytes));
-
-    var mismatched: [format.header_size]u8 = @splat(0);
-    mismatched[format.field.flags] |= @as(u8, 1) << 3;
-    try std.testing.expectError(error.Corrupt, format.Flags.detectEndian(&mismatched));
-}
-
-test "header rejects short images, bad magic, reserved flags and foreign endian" {
+test "header rejects short images, bad magic, reserved flags and foreign byte order" {
     const header: format.Header = .{
         .flags = .{},
         .table_reserved = 16,
@@ -133,20 +114,29 @@ test "header rejects short images, bad magic, reserved flags and foreign endian"
     const native_flags = std.mem.readInt(
         u64,
         bad_flags[format.field.flags..][0..8],
-        format.Endian.native,
+        .native,
     );
     std.mem.writeInt(
         u64,
         bad_flags[format.field.flags..][0..8],
         native_flags | (@as(u64, 1) << 4),
-        format.Endian.native,
+        .native,
     );
     try std.testing.expectError(error.Corrupt, format.Header.decode(&bad_flags));
 
-    var foreign_header = header;
-    foreign_header.endian = format.Endian.foreign;
-    var foreign_bytes: [format.header_size]u8 = undefined;
-    foreign_header.encode(&foreign_bytes);
+    var foreign_bytes = bytes;
+    const flags_word = std.mem.readInt(
+        u64,
+        foreign_bytes[format.field.flags..][0..8],
+        .native,
+    );
+    const order_bits = (@as(u64, 1) << 3) | (@as(u64, 1) << 59);
+    std.mem.writeInt(
+        u64,
+        foreign_bytes[format.field.flags..][0..8],
+        flags_word ^ order_bits,
+        .native,
+    );
     try std.testing.expectError(
         error.UnsupportedEndianness,
         format.Header.decode(&foreign_bytes),
@@ -184,22 +174,20 @@ test "table entry accessors across all width combinations" {
                 };
 
                 const pos = 3;
-                inline for (.{ format.Endian.little, format.Endian.big }) |order| {
-                    var bytes: [Entry.size + 8]u8 = @splat(0xAA);
-                    Entry.write(&bytes, pos, fields, order);
+                var bytes: [Entry.size + 8]u8 = @splat(0xAA);
+                Entry.write(&bytes, pos, fields);
 
-                    const got = Entry.read(&bytes, pos, order);
-                    try std.testing.expectEqual(fields.hash, got.hash);
-                    try std.testing.expectEqual(fields.key_off, got.key_off);
-                    try std.testing.expectEqual(fields.val_off, got.val_off);
-                    try std.testing.expectEqual(fields.hash, Entry.readHash(&bytes, pos, order));
+                const got = Entry.read(&bytes, pos);
+                try std.testing.expectEqual(fields.hash, got.hash);
+                try std.testing.expectEqual(fields.key_off, got.key_off);
+                try std.testing.expectEqual(fields.val_off, got.val_off);
+                try std.testing.expectEqual(fields.hash, Entry.readHash(&bytes, pos));
 
-                    for (bytes[0..pos]) |sentinel| {
-                        try std.testing.expectEqual(@as(u8, 0xAA), sentinel);
-                    }
-                    for (bytes[pos + Entry.size ..]) |sentinel| {
-                        try std.testing.expectEqual(@as(u8, 0xAA), sentinel);
-                    }
+                for (bytes[0..pos]) |sentinel| {
+                    try std.testing.expectEqual(@as(u8, 0xAA), sentinel);
+                }
+                for (bytes[pos + Entry.size ..]) |sentinel| {
+                    try std.testing.expectEqual(@as(u8, 0xAA), sentinel);
                 }
             }
         }
@@ -220,24 +208,22 @@ test "block accessors across index widths" {
         const size: u64 = if (width == .u32) 40 else 4096;
         const len: u64 = if (width == .u32) 24 else 1024;
 
-        inline for (.{ format.Endian.little, format.Endian.big }) |order| {
-            const pos = 3;
-            var bytes: [B.header_size + 16]u8 = @splat(0xCC);
+        const pos = 3;
+        var bytes: [B.header_size + 16]u8 = @splat(0xCC);
 
-            B.writeSize(&bytes, pos, size, order);
-            B.writeLen(&bytes, pos, len, order);
-            try std.testing.expectEqual(size, B.readSize(&bytes, pos, order));
-            try std.testing.expectEqual(len, B.readLen(&bytes, pos, order));
+        B.writeSize(&bytes, pos, size);
+        B.writeLen(&bytes, pos, len);
+        try std.testing.expectEqual(size, B.readSize(&bytes, pos));
+        try std.testing.expectEqual(len, B.readLen(&bytes, pos));
 
-            B.writeNext(&bytes, pos, B.none, order);
-            try std.testing.expectEqual(B.none, B.readNext(&bytes, pos, order));
+        B.writeNext(&bytes, pos, B.none);
+        try std.testing.expectEqual(B.none, B.readNext(&bytes, pos));
 
-            for (bytes[0..pos]) |sentinel| {
-                try std.testing.expectEqual(@as(u8, 0xCC), sentinel);
-            }
-            for (bytes[pos + B.header_size ..]) |sentinel| {
-                try std.testing.expectEqual(@as(u8, 0xCC), sentinel);
-            }
+        for (bytes[0..pos]) |sentinel| {
+            try std.testing.expectEqual(@as(u8, 0xCC), sentinel);
+        }
+        for (bytes[pos + B.header_size ..]) |sentinel| {
+            try std.testing.expectEqual(@as(u8, 0xCC), sentinel);
         }
     }
 }
@@ -408,18 +394,18 @@ test "layout rejects overflowing options" {
 test "arena u32 splits, coalesces and reclaims the whole section" {
     const Block = format.Block(.u32);
     var memory: [128]u8 = undefined;
-    var a = try arena.Arena.initEmpty(&memory, .u32, .little);
+    var a = try arena.Arena.initEmpty(&memory, .u32);
 
     try std.testing.expectEqual(@as(u64, 0), a.free_head);
-    try std.testing.expectEqual(@as(u64, 128), Block.readSize(&memory, 0, .little));
-    try std.testing.expectEqual(Block.none, Block.readNext(&memory, 0, .little));
+    try std.testing.expectEqual(@as(u64, 128), Block.readSize(&memory, 0));
+    try std.testing.expectEqual(Block.none, Block.readNext(&memory, 0));
 
     const first = try a.alloc(8);
     try std.testing.expectEqual(@as(u64, 0), first);
     try std.testing.expectEqual(@as(u64, 16), a.blockSize(first));
     try std.testing.expectEqual(@as(u64, 8), @as(u64, @intCast(a.payload(first).len)));
     try std.testing.expectEqual(@as(u64, 16), a.free_head);
-    try std.testing.expectEqual(@as(u64, 112), Block.readSize(&memory, 16, .little));
+    try std.testing.expectEqual(@as(u64, 112), Block.readSize(&memory, 16));
 
     a.payloadMut(first)[0] = 0xAB;
     try std.testing.expectEqual(@as(u8, 0xAB), a.payload(first)[0]);
@@ -429,17 +415,17 @@ test "arena u32 splits, coalesces and reclaims the whole section" {
     try std.testing.expectEqual(@as(u64, 8), a.blockSize(second));
     try std.testing.expectEqual(@as(u64, 0), @as(u64, @intCast(a.payload(second).len)));
     try std.testing.expectEqual(@as(u64, 24), a.free_head);
-    try std.testing.expectEqual(@as(u64, 104), Block.readSize(&memory, 24, .little));
+    try std.testing.expectEqual(@as(u64, 104), Block.readSize(&memory, 24));
 
     try a.free(first);
     try std.testing.expectEqual(@as(u64, 0), a.free_head);
-    try std.testing.expectEqual(@as(u64, 16), Block.readSize(&memory, 0, .little));
-    try std.testing.expectEqual(@as(u64, 24), Block.readNext(&memory, 0, .little));
+    try std.testing.expectEqual(@as(u64, 16), Block.readSize(&memory, 0));
+    try std.testing.expectEqual(@as(u64, 24), Block.readNext(&memory, 0));
 
     try a.free(second);
     try std.testing.expectEqual(@as(u64, 0), a.free_head);
-    try std.testing.expectEqual(@as(u64, 128), Block.readSize(&memory, 0, .little));
-    try std.testing.expectEqual(Block.none, Block.readNext(&memory, 0, .little));
+    try std.testing.expectEqual(@as(u64, 128), Block.readSize(&memory, 0));
+    try std.testing.expectEqual(Block.none, Block.readNext(&memory, 0));
 
     const big = try a.alloc(120);
     try std.testing.expectEqual(@as(u64, 0), big);
@@ -450,13 +436,13 @@ test "arena u32 splits, coalesces and reclaims the whole section" {
 
     try a.free(big);
     try std.testing.expectEqual(@as(u64, 0), a.free_head);
-    try std.testing.expectEqual(@as(u64, 128), Block.readSize(&memory, 0, .little));
+    try std.testing.expectEqual(@as(u64, 128), Block.readSize(&memory, 0));
 }
 
 test "arena first-fit skips a too-small free block" {
     const Block = format.Block(.u32);
     var memory: [64]u8 = undefined;
-    var a = try arena.Arena.initEmpty(&memory, .u32, .little);
+    var a = try arena.Arena.initEmpty(&memory, .u32);
 
     const first = try a.alloc(0);
     const second = try a.alloc(0);
@@ -465,7 +451,7 @@ test "arena first-fit skips a too-small free block" {
 
     try a.free(first);
     try std.testing.expectEqual(@as(u64, 0), a.free_head);
-    try std.testing.expectEqual(@as(u64, 16), Block.readNext(&memory, 0, .little));
+    try std.testing.expectEqual(@as(u64, 16), Block.readNext(&memory, 0));
 
     const third = try a.alloc(8);
     try std.testing.expectEqual(@as(u64, 16), third);
@@ -474,21 +460,21 @@ test "arena first-fit skips a too-small free block" {
     // The skipped 8-byte block at offset 0 is still the head and now points at
     // the split remainder at offset 32.
     try std.testing.expectEqual(@as(u64, 0), a.free_head);
-    try std.testing.expectEqual(@as(u64, 8), Block.readSize(&memory, 0, .little));
-    try std.testing.expectEqual(@as(u64, 32), Block.readNext(&memory, 0, .little));
-    try std.testing.expectEqual(@as(u64, 32), Block.readSize(&memory, 32, .little));
-    try std.testing.expectEqual(Block.none, Block.readNext(&memory, 32, .little));
+    try std.testing.expectEqual(@as(u64, 8), Block.readSize(&memory, 0));
+    try std.testing.expectEqual(@as(u64, 32), Block.readNext(&memory, 0));
+    try std.testing.expectEqual(@as(u64, 32), Block.readSize(&memory, 32));
+    try std.testing.expectEqual(Block.none, Block.readNext(&memory, 32));
 }
 
 test "arena u64 consumes an 8-byte tail that cannot hold a header" {
     const Block = format.Block(.u64);
     var memory: [32]u8 = undefined;
-    var a = try arena.Arena.initEmpty(&memory, .u64, .little);
+    var a = try arena.Arena.initEmpty(&memory, .u64);
 
     const off = try a.alloc(8);
     try std.testing.expectEqual(@as(u64, 0), off);
     try std.testing.expectEqual(@as(u64, 32), @as(u64, @intCast(a.blockSize(off))));
-    try std.testing.expectEqual(@as(u64, 32), Block.readSize(&memory, 0, .little));
+    try std.testing.expectEqual(@as(u64, 32), Block.readSize(&memory, 0));
     try std.testing.expectEqual(Block.none, a.free_head);
     try std.testing.expectError(error.OutOfSpace, a.alloc(0));
 }
@@ -496,14 +482,14 @@ test "arena u64 consumes an 8-byte tail that cannot hold a header" {
 test "failed arena allocation leaves the free list intact" {
     const Block = format.Block(.u32);
     var memory: [32]u8 = undefined;
-    var a = try arena.Arena.initEmpty(&memory, .u32, .little);
+    var a = try arena.Arena.initEmpty(&memory, .u32);
 
     const first = try a.alloc(8);
     try std.testing.expectEqual(@as(u64, 16), a.free_head);
     try std.testing.expectError(error.OutOfSpace, a.alloc(16));
     try std.testing.expectEqual(@as(u64, 16), a.free_head);
-    try std.testing.expectEqual(@as(u64, 16), Block.readSize(&memory, 16, .little));
-    try std.testing.expectEqual(Block.none, Block.readNext(&memory, 16, .little));
+    try std.testing.expectEqual(@as(u64, 16), Block.readSize(&memory, 16));
+    try std.testing.expectEqual(Block.none, Block.readNext(&memory, 16));
 
     try a.free(first);
     const full = try a.alloc(24);
@@ -512,16 +498,16 @@ test "failed arena allocation leaves the free list intact" {
 }
 
 test "arena rejects malformed construction and invalid frees" {
-    try std.testing.expectError(error.Corrupt, arena.Arena.initEmpty(&[_]u8{}, .u32, .little));
+    try std.testing.expectError(error.Corrupt, arena.Arena.initEmpty(&[_]u8{}, .u32));
     var too_short: [7]u8 = undefined;
-    try std.testing.expectError(error.Corrupt, arena.Arena.initEmpty(&too_short, .u32, .little));
+    try std.testing.expectError(error.Corrupt, arena.Arena.initEmpty(&too_short, .u32));
     var unaligned: [9]u8 = undefined;
-    try std.testing.expectError(error.Corrupt, arena.Arena.initEmpty(&unaligned, .u32, .little));
+    try std.testing.expectError(error.Corrupt, arena.Arena.initEmpty(&unaligned, .u32));
     var short_u64: [15]u8 = undefined;
-    try std.testing.expectError(error.Corrupt, arena.Arena.initEmpty(&short_u64, .u64, .little));
+    try std.testing.expectError(error.Corrupt, arena.Arena.initEmpty(&short_u64, .u64));
 
     var memory: [32]u8 = undefined;
-    var a = try arena.Arena.initEmpty(&memory, .u32, .little);
+    var a = try arena.Arena.initEmpty(&memory, .u32);
     const off = try a.alloc(8);
 
     try std.testing.expectError(error.Corrupt, a.free(4));
@@ -531,10 +517,10 @@ test "arena rejects malformed construction and invalid frees" {
 }
 
 test "arena property: random alloc/free matches a bitmap reference" {
-    try runArenaProperty(.u32, .little, 0xA11CE_0001);
-    try runArenaProperty(.u32, .big, 0xA11CE_0002);
-    try runArenaProperty(.u64, .little, 0xA11CE_0003);
-    try runArenaProperty(.u64, .big, 0xA11CE_0004);
+    try runArenaProperty(.u32, 0xA11CE_0001);
+    try runArenaProperty(.u32, 0xA11CE_0002);
+    try runArenaProperty(.u64, 0xA11CE_0003);
+    try runArenaProperty(.u64, 0xA11CE_0004);
 }
 
 const AllocRange = struct {
@@ -602,7 +588,7 @@ const ReferenceArena = struct {
     }
 };
 
-fn runArenaProperty(comptime width: format.IndexWidth, order: format.Endian, seed: u64) !void {
+fn runArenaProperty(comptime width: format.IndexWidth, seed: u64) !void {
     const allocator = std.testing.allocator;
     const capacity: usize = 2048;
     const Block = format.Block(width);
@@ -610,7 +596,7 @@ fn runArenaProperty(comptime width: format.IndexWidth, order: format.Endian, see
     const memory = try allocator.alloc(u8, capacity);
     defer allocator.free(memory);
 
-    var actual = try arena.Arena.initEmpty(memory, width, order);
+    var actual = try arena.Arena.initEmpty(memory, width);
     var reference = try ReferenceArena.init(allocator, capacity, @intCast(Block.header_size));
     defer reference.deinit(allocator);
 
@@ -661,7 +647,7 @@ fn runArenaProperty(comptime width: format.IndexWidth, order: format.Endian, see
         for (live.items) |item| {
             try checkPattern(actual.payload(item.off), item.id);
         }
-        try checkArenaInvariants(&actual, &reference, width, order);
+        try checkArenaInvariants(&actual, &reference, width);
     }
 
     // Freeing everything must collapse the arena back into one full block.
@@ -671,16 +657,15 @@ fn runArenaProperty(comptime width: format.IndexWidth, order: format.Endian, see
     }
     live.clearRetainingCapacity();
 
-    try checkArenaInvariants(&actual, &reference, width, order);
+    try checkArenaInvariants(&actual, &reference, width);
     try std.testing.expectEqual(@as(u64, 0), actual.free_head);
-    try std.testing.expectEqual(@as(u64, capacity), Block.readSize(actual.memory, 0, order));
+    try std.testing.expectEqual(@as(u64, capacity), Block.readSize(actual.memory, 0));
 }
 
 fn checkArenaInvariants(
     actual: *const arena.Arena,
     reference: *const ReferenceArena,
     comptime width: format.IndexWidth,
-    order: format.Endian,
 ) !void {
     const Block = format.Block(width);
     const testing = std.testing;
@@ -695,19 +680,19 @@ fn checkArenaInvariants(
         try testing.expect(cur < capacity);
         try testing.expect(cur % 8 == 0);
 
-        const size = Block.readSize(actual.memory, @intCast(cur), order);
+        const size = Block.readSize(actual.memory, @intCast(cur));
         try testing.expect(size >= Block.min_size);
         try testing.expect(size % 8 == 0);
         try testing.expect(size <= capacity - cur);
 
         if (prev != Block.none) {
-            const prev_size = Block.readSize(actual.memory, @intCast(prev), order);
+            const prev_size = Block.readSize(actual.memory, @intCast(prev));
             try testing.expect(cur > prev);
             try testing.expect(prev + prev_size < cur);
         }
 
         prev = cur;
-        cur = Block.readNext(actual.memory, @intCast(cur), order);
+        cur = Block.readNext(actual.memory, @intCast(cur));
         free_nodes += 1;
         try testing.expect(free_nodes <= capacity / Block.min_size + 1);
     }
@@ -717,7 +702,7 @@ fn checkArenaInvariants(
     var off: u64 = 0;
     var tiles: u64 = 0;
     while (off < capacity) {
-        const size = Block.readSize(actual.memory, @intCast(off), order);
+        const size = Block.readSize(actual.memory, @intCast(off));
         try testing.expect(size >= Block.min_size);
         try testing.expect(size % 8 == 0);
         try testing.expect(size <= capacity - off);
@@ -725,14 +710,14 @@ fn checkArenaInvariants(
         if (free_cursor != Block.none and free_cursor == off) {
             try testing.expectEqual(
                 size,
-                Block.readSize(actual.memory, @intCast(free_cursor), order),
+                Block.readSize(actual.memory, @intCast(free_cursor)),
             );
             for (reference.used[@intCast(off)..][0..@intCast(size)]) |used| {
                 try testing.expect(!used);
             }
-            free_cursor = Block.readNext(actual.memory, @intCast(free_cursor), order);
+            free_cursor = Block.readNext(actual.memory, @intCast(free_cursor));
         } else {
-            const len = Block.readLen(actual.memory, @intCast(off), order);
+            const len = Block.readLen(actual.memory, @intCast(off));
             try testing.expect(len <= size - header_size);
             for (reference.used[@intCast(off)..][0..@intCast(size)]) |used| {
                 try testing.expect(used);
@@ -789,10 +774,10 @@ test "table supports all width combinations" {
                 const injectable_hash: u64 = 0x1234;
 
                 var table_memory: [16 * entry_size]u8 = undefined;
-                var table = try tables.Table.formatEmpty(&table_memory, flags, slots, .little);
+                var table = try tables.Table.formatEmpty(&table_memory, flags, slots);
 
                 var key_memory: [256]u8 = undefined;
-                var keys = try arena.Arena.initEmpty(&key_memory, key_width, .little);
+                var keys = try arena.Arena.initEmpty(&key_memory, key_width);
 
                 const texts = [_][]const u8{ "alpha", "beta", "gamma" };
                 var key_offsets: [texts.len]u64 = undefined;
@@ -847,10 +832,10 @@ test "table supports all width combinations" {
 test "table backward-shift moves entries whose home is before the hole" {
     const flags: format.Flags = .{};
     var table_memory: [16 * 16]u8 = undefined;
-    var table = try tables.Table.formatEmpty(&table_memory, flags, 16, .little);
+    var table = try tables.Table.formatEmpty(&table_memory, flags, 16);
 
     var key_memory: [128]u8 = undefined;
-    var keys = try arena.Arena.initEmpty(&key_memory, .u32, .little);
+    var keys = try arena.Arena.initEmpty(&key_memory, .u32);
 
     const a_off = try putArenaKey(&keys, "a");
     const b_off = try putArenaKey(&keys, "b");
@@ -882,10 +867,10 @@ test "table backward-shift moves entries whose home is before the hole" {
 test "table backward-shift keeps entries whose home lies inside the gap" {
     const flags: format.Flags = .{};
     var table_memory: [16 * 16]u8 = undefined;
-    var table = try tables.Table.formatEmpty(&table_memory, flags, 16, .little);
+    var table = try tables.Table.formatEmpty(&table_memory, flags, 16);
 
     var key_memory: [128]u8 = undefined;
-    var keys = try arena.Arena.initEmpty(&key_memory, .u32, .little);
+    var keys = try arena.Arena.initEmpty(&key_memory, .u32);
 
     const a_off = try putArenaKey(&keys, "a");
     const b_off = try putArenaKey(&keys, "b");
@@ -912,10 +897,10 @@ test "table backward-shift keeps entries whose home lies inside the gap" {
 test "table probes wrap around slot zero" {
     const flags: format.Flags = .{};
     var table_memory: [16 * 16]u8 = undefined;
-    var table = try tables.Table.formatEmpty(&table_memory, flags, 16, .little);
+    var table = try tables.Table.formatEmpty(&table_memory, flags, 16);
 
     var key_memory: [128]u8 = undefined;
-    var keys = try arena.Arena.initEmpty(&key_memory, .u32, .little);
+    var keys = try arena.Arena.initEmpty(&key_memory, .u32);
 
     const a_off = try putArenaKey(&keys, "a");
     const b_off = try putArenaKey(&keys, "b");
@@ -947,10 +932,10 @@ test "table probes wrap around slot zero" {
 test "table enforces the 0.75 load factor and accounts for deletes" {
     const flags: format.Flags = .{};
     var table_memory: [16 * 16]u8 = undefined;
-    var table = try tables.Table.formatEmpty(&table_memory, flags, 16, .little);
+    var table = try tables.Table.formatEmpty(&table_memory, flags, 16);
 
     var key_memory: [512]u8 = undefined;
-    var keys = try arena.Arena.initEmpty(&key_memory, .u32, .little);
+    var keys = try arena.Arena.initEmpty(&key_memory, .u32);
 
     var buffer: [16]u8 = undefined;
     var i: u64 = 0;
@@ -985,24 +970,24 @@ test "table init rejects malformed shape and load accounting" {
 
     try std.testing.expectError(
         error.Corrupt,
-        tables.Table.init(&memory, flags, 8, .little, 0),
+        tables.Table.init(&memory, flags, 8, 0),
     );
     try std.testing.expectError(
         error.Corrupt,
-        tables.Table.init(&memory, flags, 32, .little, 0),
+        tables.Table.init(&memory, flags, 32, 0),
     );
     try std.testing.expectError(
         error.Corrupt,
-        tables.Table.init(&memory, flags, 16, .little, 13),
+        tables.Table.init(&memory, flags, 16, 13),
     );
 
     var non_power_memory: [24 * 16]u8 = undefined;
     try std.testing.expectError(
         error.Corrupt,
-        tables.Table.init(&non_power_memory, flags, 24, .little, 0),
+        tables.Table.init(&non_power_memory, flags, 24, 0),
     );
 
-    const table = try tables.Table.init(&memory, flags, 16, .little, 12);
+    const table = try tables.Table.init(&memory, flags, 16, 12);
     try std.testing.expectEqual(@as(u64, 12), table.count);
 }
 
@@ -1597,29 +1582,29 @@ test "image validation rejects short, long, and corrupt images" {
     {
         const copy = try allocator.dupe(u8, valid);
         defer allocator.free(copy);
-        const word = std.mem.readInt(u64, copy[format.field.flags..][0..8], format.Endian.native);
+        const word = std.mem.readInt(u64, copy[format.field.flags..][0..8], .native);
         std.mem.writeInt(
             u64,
             copy[format.field.flags..][0..8],
             word | (@as(u64, 1) << 4),
-            format.Endian.native,
+            .native,
         );
         try std.testing.expectError(error.Corrupt, image.validate(copy));
     }
 
-    // Foreign byte order and mismatched byte-order copies.
+    // Saved byte order differs from the host.
     {
         const foreign = try allocator.dupe(u8, valid);
         defer allocator.free(foreign);
-        foreign[format.field.flags] |= @as(u8, 1) << 3;
-        foreign[format.field.flags + 7] |= @as(u8, 1) << 3;
+        const word = std.mem.readInt(u64, foreign[format.field.flags..][0..8], .native);
+        const order_bits = (@as(u64, 1) << 3) | (@as(u64, 1) << 59);
+        std.mem.writeInt(
+            u64,
+            foreign[format.field.flags..][0..8],
+            word ^ order_bits,
+            .native,
+        );
         try std.testing.expectError(error.UnsupportedEndianness, image.validate(foreign));
-    }
-    {
-        const mismatched = try allocator.dupe(u8, valid);
-        defer allocator.free(mismatched);
-        mismatched[format.field.flags] |= @as(u8, 1) << 3;
-        try std.testing.expectError(error.Corrupt, image.validate(mismatched));
     }
 
     // Table size mismatch.
@@ -1629,13 +1614,13 @@ test "image validation rejects short, long, and corrupt images" {
         const size = std.mem.readInt(
             u64,
             copy[format.field.table_size..][0..8],
-            format.Endian.native,
+            .native,
         );
         std.mem.writeInt(
             u64,
             copy[format.field.table_size..][0..8],
             size + 1,
-            format.Endian.native,
+            .native,
         );
         try std.testing.expectError(error.Corrupt, image.validate(copy));
     }
@@ -1648,7 +1633,7 @@ test "image validation rejects short, long, and corrupt images" {
             u64,
             copy[format.field.key_free_head..][0..8],
             std.math.maxInt(u64),
-            format.Endian.native,
+            .native,
         );
         try std.testing.expectError(error.Corrupt, image.validate(copy));
     }
@@ -1668,15 +1653,14 @@ test "image validation rejects short, long, and corrupt images" {
             )],
             header.flags,
             header.table_reserved,
-            header.endian,
             header.table_size,
         );
         const slot = hash_table.lookup(&store.keys, "alpha", hash_mod.hashKey("alpha", header.flags.hash)).?;
         const Entry = format.TableEntry(.city64, .u32, .u32);
         const pos = format.header_size + @as(usize, @intCast(slot.index)) * Entry.size;
-        var fields = Entry.read(copy, pos, header.endian);
+        var fields = Entry.read(copy, pos);
         fields.key_off = 0xFFFF_FFF0;
-        Entry.write(copy, pos, fields, header.endian);
+        Entry.write(copy, pos, fields);
         try std.testing.expectError(error.Corrupt, image.validate(copy));
     }
 
@@ -1687,13 +1671,13 @@ test "image validation rejects short, long, and corrupt images" {
         const val_off = storeValueOff(&store, "alpha");
         const absolute = @as(usize, @intCast(store.values_offset + val_off));
         const Block = format.Block(.u32);
-        const size = Block.readSize(copy, absolute, format.Endian.native);
-        Block.writeLen(copy, absolute, size, format.Endian.native);
+        const size = Block.readSize(copy, absolute);
+        Block.writeLen(copy, absolute, size);
         try std.testing.expectError(error.Corrupt, image.validate(copy));
     }
 }
 
-test "load reports corruption and endianness errors without leaking" {
+test "load reports corruption and byte-order errors without leaking" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1729,8 +1713,14 @@ test "load reports corruption and endianness errors without leaking" {
 
     const foreign = try allocator.dupe(u8, valid);
     defer allocator.free(foreign);
-    foreign[format.field.flags] |= @as(u8, 1) << 3;
-    foreign[format.field.flags + 7] |= @as(u8, 1) << 3;
+    const flags_word = std.mem.readInt(u64, foreign[format.field.flags..][0..8], .native);
+    const order_bits = (@as(u64, 1) << 3) | (@as(u64, 1) << 59);
+    std.mem.writeInt(
+        u64,
+        foreign[format.field.flags..][0..8],
+        flags_word ^ order_bits,
+        .native,
+    );
     try tmp.dir.writeFile(io, .{ .sub_path = "foreign.zkv", .data = foreign });
     try std.testing.expectError(
         error.UnsupportedEndianness,
@@ -1739,7 +1729,7 @@ test "load reports corruption and endianness errors without leaking" {
 }
 
 test "golden image loads and resaves byte-identically" {
-    if (format.native_endian != .little) return error.SkipZigTest;
+    if (std.lang.Endian.native != .little) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1773,7 +1763,7 @@ test "golden image loads and resaves byte-identically" {
 }
 
 test "committed corrupt fixtures are rejected" {
-    if (format.native_endian != .little) return error.SkipZigTest;
+    if (std.lang.Endian.native != .little) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
