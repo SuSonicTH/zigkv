@@ -1,0 +1,19 @@
+.{
+    .name = .zigkv,
+    .version = "0.1.0",
+    .fingerprint = 0x41990c3af3a3e53c,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+        "docs",
+        "README.md",
+        "PLAN.md",
+        "LICENSE",
+        "bench",
+        "testdata",
+    },
+}
