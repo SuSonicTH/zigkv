@@ -290,56 +290,68 @@ fn validateEntries(
     key_memory: []const u8,
     value_memory: []const u8,
 ) !void {
-    const hash_table = try table_mod.Table.init(
-        @constCast(table_memory),
-        header.flags,
-        header.table_reserved,
-        header.table_size,
-    );
+    return switch (header.flags.hash) {
+        inline else => |hash_width| switch (header.flags.key_index) {
+            inline else => |key_width| switch (header.flags.value_index) {
+                inline else => |value_width| validateEntriesImpl(
+                    hash_width,
+                    key_width,
+                    value_width,
+                    table_memory,
+                    header,
+                    key_memory,
+                    value_memory,
+                ),
+            },
+        },
+    };
+}
+
+/// Validate every live entry with the widths fixed at compile time. This is
+/// the bulk of load-time validation, so it avoids a per-entry width dispatch
+/// and inlines the block checks.
+fn validateEntriesImpl(
+    comptime hash_width: format.HashWidth,
+    comptime key_width: format.IndexWidth,
+    comptime value_width: format.IndexWidth,
+    table_memory: []const u8,
+    header: format.Header,
+    key_memory: []const u8,
+    value_memory: []const u8,
+) !void {
+    const Entry = format.TableEntry(hash_width, key_width, value_width);
+    const KeyBlock = format.Block(key_width);
+    const ValueBlock = format.Block(value_width);
 
     var count: u64 = 0;
     var index: u64 = 0;
-    while (index < hash_table.slots) : (index += 1) {
-        const entry = hash_table.entryAt(index);
-        if (entry.hash == 0) continue;
+    while (index < header.table_reserved) : (index += 1) {
+        const pos: usize = @intCast(index * Entry.size);
+        if (Entry.readHash(table_memory, pos) == 0) continue;
 
         count += 1;
-        _ = try validateBlock(
+        _ = try validateTypedBlock(
+            KeyBlock,
             key_memory,
-            header.flags.key_index,
-            entry.key_off,
+            Entry.readKeyOff(table_memory, pos),
         );
-        _ = try validateBlock(
+        _ = try validateTypedBlock(
+            ValueBlock,
             value_memory,
-            header.flags.value_index,
-            entry.val_off,
+            Entry.readValOff(table_memory, pos),
         );
     }
 
     if (count != header.table_size) return error.Corrupt;
 }
 
-/// Validate an allocated block header and return its payload length.
-fn validateBlock(
-    memory: []const u8,
-    width: format.IndexWidth,
-    offset: u64,
-) !u64 {
-    return switch (width) {
-        inline else => |comptime_width| validateBlockImpl(
-            comptime_width,
-            memory,
-            offset,
-        ),
-    };
-}
-
-fn validateBlockImpl(
-    comptime width: format.IndexWidth,
+/// Validate an allocated block header and return its payload length. The block
+/// type is fixed at compile time; inline so callers avoid generic dispatch.
+inline fn validateTypedBlock(
+    comptime Block: type,
     memory: []const u8,
     offset: u64,
 ) !u64 {
-    const Block = format.Block(width);
     const capacity: u64 = @intCast(memory.len);
     const header_size: u64 = @intCast(Block.header_size);
 

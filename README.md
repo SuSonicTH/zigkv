@@ -172,6 +172,10 @@ See [docs/file-format.md](docs/file-format.md) for the full specification and
   reachability, but it does not detect every malformed image accepted by
   `load`; in particular, a fabricated block header inside an allocated block
   can pass both `load` and `verify()`.
+- **Removal cost depends on free-list length.** The address-ordered free list
+  makes `remove` walk the free blocks that sort before the freed block. Random
+  removal from a large store can be orders of magnitude slower than removing
+  keys in ascending order; see [docs/performance.md](docs/performance.md).
 
 ## Building
 

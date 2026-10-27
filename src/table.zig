@@ -254,18 +254,17 @@ pub fn Impl(
             Entry.write(self.memory, pos(index), fields);
         }
 
-        /// Compare two keys, short-circuiting on a single 8-byte load for the
-        /// common case instead of calling `memcmp`.
+        /// Compare two keys, short-circuiting on an inline 8-byte load for the
+        /// common case. Shorter and longer keys fall back to out-of-line
+        /// helpers so every probe path stays compact.
         inline fn keysEqual(a: []const u8, b: []const u8) bool {
             if (a.len != b.len) return false;
             if (a.len >= 8) {
-                const a_prefix = @as(*align(1) const u64, @ptrCast(a.ptr)).*;
-                const b_prefix = @as(*align(1) const u64, @ptrCast(b.ptr)).*;
-                if (a_prefix != b_prefix) return false;
+                if (loadBytes(u64, a.ptr) != loadBytes(u64, b.ptr)) return false;
                 if (a.len == 8) return true;
-                return std.mem.eql(u8, a[8..], b[8..]);
+                return longKeyEqual(a, b);
             }
-            return std.mem.eql(u8, a, b);
+            return shortKeyEqual(a, b);
         }
 
         inline fn keyAt(self: *const Table, keys: *const arena.Arena, index: u64) []const u8 {
@@ -483,6 +482,46 @@ pub fn Impl(
             );
         }
     };
+}
+
+/// Load a naturally-aligned-width integer from an unaligned address.
+inline fn loadBytes(comptime T: type, p: [*]const u8) T {
+    return @as(*align(1) const T, @ptrCast(p)).*;
+}
+
+/// Compare keys shorter than 8 bytes without calling `memcmp`. The caller has
+/// already checked that the lengths match.
+noinline fn shortKeyEqual(a: []const u8, b: []const u8) bool {
+    std.debug.assert(a.len == b.len and a.len < 8);
+    const len = a.len;
+
+    if (len >= 4) {
+        if (loadBytes(u32, a.ptr) != loadBytes(u32, b.ptr)) return false;
+        if (len == 4) return true;
+        // The first and last 4 bytes overlap and cover lengths 5 through 7.
+        return loadBytes(u32, a.ptr + (len - 4)) ==
+            loadBytes(u32, b.ptr + (len - 4));
+    }
+    if (len >= 2) {
+        if (loadBytes(u16, a.ptr) != loadBytes(u16, b.ptr)) return false;
+        if (len == 2) return true;
+        return loadBytes(u16, a.ptr + (len - 2)) ==
+            loadBytes(u16, b.ptr + (len - 2));
+    }
+    if (len == 1) return a[0] == b[0];
+    return true;
+}
+
+/// Compare keys longer than 8 bytes after the caller compared the first 8.
+noinline fn longKeyEqual(a: []const u8, b: []const u8) bool {
+    std.debug.assert(a.len == b.len and a.len > 8);
+
+    if (a.len <= 16) {
+        // First 8 bytes were equal; compare the last 8 to cover the rest.
+        return loadBytes(u64, a.ptr + (a.len - 8)) ==
+            loadBytes(u64, b.ptr + (b.len - 8));
+    }
+    return std.mem.eql(u8, a[8..], b[8..]);
 }
 
 /// True when `home` lies in the cyclic interval `(hole, k]`. Such an entry

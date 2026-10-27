@@ -473,34 +473,7 @@ fn Impl(
             const found = try Table.probe(&s.hash_table, &s.keys, key, hash_value);
 
             if (found.entry) |entry| {
-                const value_len: u64 = @intCast(value.len);
-                if (value_len > maxValueLen(s)) return error.ValueTooLarge;
-
-                const old_off = entry.val_off;
-                const old_size = ValueArena.sizeAt(&s.values, old_off);
-
-                if (value_len <= old_size - ValueArena.header_size) {
-                    // Keep the block: write the new payload, update `len`, and
-                    // return any tail that can hold a minimum block.
-                    if (value.len != 0) {
-                        copyPayload(
-                            ValueArena.payloadSpan(&s.values, old_off)[0..value.len],
-                            value,
-                        );
-                    }
-                    try ValueArena.shrinkToFit(&s.values, old_off, value_len);
-                } else {
-                    const block = try ValueArena.allocBlock(&s.values, value_len);
-                    errdefer freeBlock(ValueArena, &s.values, block.off);
-
-                    copyPayload(block.payload, value);
-                    Table.setValueOffset(&s.hash_table, found.index, block.off);
-                    freeBlock(ValueArena, &s.values, old_off);
-                }
-
-                s.syncHeader();
-                s.generation += 1;
-                return;
+                return putExisting(s, found.index, entry.val_off, value);
             }
 
             const key_len: u64 = @intCast(key.len);
@@ -524,6 +497,43 @@ fn Impl(
             s.generation += 1;
         }
 
+        /// Overwrite the value of an existing key. Kept out of line so the
+        /// insert path above stays small; the arena coalescing code linked
+        /// from the grow/replace branch is not needed there.
+        noinline fn putExisting(
+            s: *Store,
+            index: u64,
+            old_off: u64,
+            value: []const u8,
+        ) !void {
+            const value_len: u64 = @intCast(value.len);
+            if (value_len > maxValueLen(s)) return error.ValueTooLarge;
+
+            const old_size = ValueArena.sizeAt(&s.values, old_off);
+
+            if (value_len <= old_size - ValueArena.header_size) {
+                // Keep the block: write the new payload, update `len`, and
+                // return any tail that can hold a minimum block.
+                if (value.len != 0) {
+                    copyPayload(
+                        ValueArena.payloadSpan(&s.values, old_off)[0..value.len],
+                        value,
+                    );
+                }
+                try ValueArena.shrinkToFit(&s.values, old_off, value_len);
+            } else {
+                const block = try ValueArena.allocBlock(&s.values, value_len);
+                errdefer freeBlock(ValueArena, &s.values, block.off);
+
+                copyPayload(block.payload, value);
+                Table.setValueOffset(&s.hash_table, index, block.off);
+                freeBlock(ValueArena, &s.values, old_off);
+            }
+
+            s.syncHeader();
+            s.generation += 1;
+        }
+
         fn get(s: *const Store, key: []const u8, buffer: []u8) !?[]const u8 {
             const val_off = Table.lookupValueOff(
                 &s.hash_table,
@@ -534,7 +544,7 @@ fn Impl(
 
             const value = ValueArena.payloadConst(&s.values, val_off);
             if (value.len > buffer.len) return error.BufferTooSmall;
-            @memcpy(buffer[0..value.len], value);
+            copyPayload(buffer[0..value.len], value);
             return buffer[0..value.len];
         }
 
@@ -562,7 +572,7 @@ fn Impl(
 
             const value = ValueArena.payloadConst(&s.values, val_off);
             const copy = try allocator.alloc(u8, value.len);
-            @memcpy(copy, value);
+            copyPayload(copy, value);
             return copy;
         }
 
@@ -573,7 +583,7 @@ fn Impl(
                 key,
                 hashKey(key),
             ) orelse return null;
-            return @intCast(ValueArena.payloadConst(&s.values, val_off).len);
+            return @intCast(ValueArena.payloadLen(&s.values, val_off));
         }
 
         fn remove(s: *Store, key: []const u8) bool {

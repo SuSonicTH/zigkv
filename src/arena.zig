@@ -103,6 +103,13 @@ pub const Arena = struct {
         };
     }
 
+    /// Payload length of an allocated block, without materialising a slice.
+    pub fn payloadLen(self: *const Arena, off: u64) u64 {
+        return switch (self.width) {
+            inline else => |w| Impl(w).payloadLen(self, off),
+        };
+    }
+
     /// Mutable payload of an allocated block.
     pub fn payloadMut(self: *Arena, off: u64) []u8 {
         return switch (self.width) {
@@ -161,7 +168,7 @@ pub fn Impl(comptime width: format.IndexWidth) type {
             Block.writeNext(self.memory, 0, Block.none);
         }
 
-        pub fn alloc(self: *Arena, len: u64) !u64 {
+        pub inline fn alloc(self: *Arena, len: u64) !u64 {
             const cap = capacity(self);
             const need = try alignNeeded(len, header_size, cap);
 
@@ -219,7 +226,7 @@ pub fn Impl(comptime width: format.IndexWidth) type {
             };
         }
 
-        pub fn free(self: *Arena, off: u64) !void {
+        pub inline fn free(self: *Arena, off: u64) !void {
             const cap = capacity(self);
             if (off >= cap or off % 8 != 0) return error.Corrupt;
 
@@ -277,6 +284,10 @@ pub fn Impl(comptime width: format.IndexWidth) type {
             const start = pos(off) + Block.header_size;
             const len = lenAt(self, off);
             return self.memory[start..][0..@intCast(len)];
+        }
+
+        pub inline fn payloadLen(self: *const Arena, off: u64) u64 {
+            return lenAt(self, off);
         }
 
         pub inline fn payloadMutable(self: *Arena, off: u64) []u8 {

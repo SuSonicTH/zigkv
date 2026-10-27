@@ -829,6 +829,47 @@ test "table supports all width combinations" {
     }
 }
 
+test "table key comparison handles every length up to 32 bytes" {
+    const flags: format.Flags = .{};
+    var table_memory: [64 * 16]u8 = undefined;
+    var table = try tables.Table.formatEmpty(&table_memory, flags, 64);
+
+    var key_memory: [2048]u8 = undefined;
+    var keys = try arena.Arena.initEmpty(&key_memory, .u32);
+
+    var key_storage: [33][32]u8 = undefined;
+    var key_slices: [33][]const u8 = undefined;
+    for (0..33) |len| {
+        for (key_storage[len][0..len], 0..) |*byte, j| {
+            byte.* = @truncate(len *% 7 +% j *% 13 +% 1);
+        }
+        key_slices[len] = key_storage[len][0..len];
+    }
+
+    for (key_slices, 0..) |key, i| {
+        const off = try putArenaKey(&keys, key);
+        try table.insert(&keys, key, @intCast(0x1000 + i), off, i);
+    }
+
+    for (key_slices, 0..) |key, i| {
+        const slot = table.lookup(&keys, key, @intCast(0x1000 + i)) orelse
+            return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u64, i), slot.entry.val_off);
+    }
+
+    // A same-length key that differs only in its last byte must not match.
+    for (key_slices, 0..) |key, i| {
+        if (key.len == 0) continue;
+
+        var changed: [32]u8 = undefined;
+        @memcpy(changed[0..key.len], key);
+        changed[key.len - 1] ^= 0xFF;
+        try std.testing.expect(
+            table.lookup(&keys, changed[0..key.len], @intCast(0x1000 + i)) == null,
+        );
+    }
+}
+
 test "table backward-shift moves entries whose home is before the hole" {
     const flags: format.Flags = .{};
     var table_memory: [16 * 16]u8 = undefined;
